@@ -10,7 +10,7 @@ interface ExecutionJobData {
 
 export function startExecutionWorker() {
   const worker = new Worker<ExecutionJobData>(
-    'outreach:executions',
+    'outreach-executions',
     async (job: Job<ExecutionJobData>) => {
       const { execution_id, group_key, channel } = job.data;
 

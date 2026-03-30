@@ -284,14 +284,14 @@ export async function startScanner() {
   );
 
   // Scanner worker
-  new Worker('outreach:scanner', async (_job: Job) => {
+  new Worker('outreach-scanner', async (_job: Job) => {
     console.log('🔍 Scanner cycle starting...');
     await scanAndEnqueue();
     console.log('🔍 Scanner cycle complete');
   }, { connection, concurrency: 1 });
 
   // Recovery worker
-  new Worker('outreach:recovery', async (_job: Job) => {
+  new Worker('outreach-recovery', async (_job: Job) => {
     console.log('🔧 Recovery pass starting...');
     await recoveryPass();
   }, { connection, concurrency: 1 });

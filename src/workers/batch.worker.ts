@@ -8,7 +8,7 @@ interface BatchJobData {
 
 export function startBatchWorker() {
   const worker = new Worker<BatchJobData>(
-    'outreach:batches',
+    'outreach-batches',
     async (job: Job<BatchJobData>) => {
       const { client_id } = job.data;
 
