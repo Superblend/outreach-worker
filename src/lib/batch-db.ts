@@ -25,6 +25,6 @@ export class BatchWriter {
     const batch = this.buffer.splice(0, this.buffer.length);
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
     const { error } = await this.supabase.from(this.tableName).insert(batch);
-    if (error) console.error(`Batch insert to ${this.tableName} failed:`, error);
+    if (error) console.error(`Batch insert to ${this.tableName} failed:`, error, 'payload keys:', Object.keys(batch[0] || {}));
   }
 }

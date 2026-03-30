@@ -742,7 +742,6 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     error_message: stepError || null,
     unipile_message_id: stepResult?.provider_id || stepResult?.message_id || stepResult?.tracking_id || null,
     unipile_chat_id: stepResult?.chat_id || null,
-    created_at: new Date().toISOString(),
   };
 
   if (currentStep.step_type === 'email' && stepResult) {
@@ -901,6 +900,9 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
 }
 
 export function startExecutionWorker() {
+  const supabaseRef = config.supabase.url.match(/https?:\/\/([^.]+)/)?.[1] || 'unknown';
+  console.log(`🔗 Supabase project ref: ${supabaseRef}`);
+
   const stepResultWriter = new BatchWriter(supabase, 'unipile_step_results');
 
   const worker = new Worker<ExecutionJobData>(
