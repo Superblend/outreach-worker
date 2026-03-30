@@ -45,7 +45,7 @@ async function scanAndEnqueue() {
     .lt('updated_at', updatedAtBuffer)
     .order('batch_number', { ascending: true, nullsFirst: true })
     .order('next_execution_at', { ascending: true })
-    .limit(500);
+    .limit(config.scanLimit);
 
   if (execError) {
     console.error('Scanner: failed to fetch executions:', execError);
@@ -299,5 +299,5 @@ export async function startScanner() {
   // Also run one scan immediately on start
   await scanAndEnqueue();
 
-  console.log('✅ Scanner started (interval: 60s, recovery: 5min)');
+  console.log(`✅ Scanner started (interval: ${config.scanIntervalMs / 1000}s, recovery: 5min, limit: ${config.scanLimit})`);
 }
