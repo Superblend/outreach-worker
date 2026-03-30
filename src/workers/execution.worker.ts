@@ -747,6 +747,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   if (currentStep.step_type === 'email' && stepResult) {
     resultRecord.response_data = {
       provider_id: stepResult.provider_id,
+      tracking_id: stepResult.tracking_id,
       subject: stepResult.subject,
       is_follow_up: !!stepResult.was_reply,
       reply_to: stepResult.in_reply_to_message_id,

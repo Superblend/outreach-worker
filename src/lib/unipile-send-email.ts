@@ -98,8 +98,8 @@ export async function sendEmail(params: SendEmailParams): Promise<any> {
 
   return {
     success: true,
-    provider_id: data?.id || data?.provider_id,
-    tracking_id: data?.tracking_id,
+    provider_id: data?.provider_id || data?.object?.provider_id || data?.id,
+    tracking_id: data?.tracking_id || data?.object?.tracking_id,
     subject,
     body: htmlBody,
     was_reply: isReply,
