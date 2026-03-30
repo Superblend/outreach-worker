@@ -740,11 +740,13 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     step_type: currentStep.step_type,
     status: stepSuccess ? 'success' : 'failed',
     error_message: stepError || null,
-    unipile_message_id: stepResult?.provider_id || stepResult?.message_id || stepResult?.tracking_id || null,
+    unipile_message_id: stepResult?.provider_id || stepResult?.message_id || null,
     unipile_chat_id: stepResult?.chat_id || null,
   };
 
   if (currentStep.step_type === 'email' && stepResult) {
+    resultRecord.tracking_id = stepResult.tracking_id || null;
+    resultRecord.unipile_message_id = stepResult.provider_id || null;
     resultRecord.response_data = {
       provider_id: stepResult.provider_id,
       tracking_id: stepResult.tracking_id,

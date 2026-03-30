@@ -74,7 +74,8 @@ export async function sendEmail(params: SendEmailParams): Promise<any> {
     subject,
     body: htmlBody,
     to: [{ display_name: `${lead.first_name || ''} ${lead.last_name || ''}`.trim(), identifier: lead.email }],
-    tracking: { opens: true, links: true },
+    body_type: 'HTML',
+    tracking_options: { opens: true, links: true },
   };
 
   if (isReply && in_reply_to_message_id) {
@@ -99,7 +100,7 @@ export async function sendEmail(params: SendEmailParams): Promise<any> {
   return {
     success: true,
     provider_id: data?.provider_id || data?.object?.provider_id || data?.id,
-    tracking_id: data?.tracking_id || data?.object?.tracking_id,
+    tracking_id: data?.tracking_id || data?.object?.id || data?.id,
     subject,
     body: htmlBody,
     was_reply: isReply,
