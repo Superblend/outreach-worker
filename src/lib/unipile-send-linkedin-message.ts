@@ -112,27 +112,38 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
     }),
   });
 
+  let shouldFallbackToChat = false;
+
   if (inviteRes.ok) {
     const inviteData = await inviteRes.json().catch(() => null);
+    const inviteId = inviteData?.id || inviteData?.invitation_id || inviteData?.data?.id;
 
-    if (!inviteData?.id) {
-      return { success: false, error: 'Invite sent but no id returned' };
+    if (inviteId) {
+      return {
+        success: true,
+        invitation_id: inviteId,
+        provider_id: providerId,
+        public_identifier: publicIdentifier,
+        personalized_message: personalizedMessage,
+        raw: inviteData,
+      };
     }
 
-    return {
-      success: true,
-      invitation_id: inviteData.id,
-      provider_id: providerId,
-      public_identifier: publicIdentifier,
-      personalized_message: personalizedMessage,
-      raw: inviteData,
-    };
+    // 2xx but no usable ID — fall through to chat-based send
+    console.warn(`[linkedin_message] Invite returned 2xx but no ID for ${publicIdentifier}, falling back to chat`);
+    shouldFallbackToChat = true;
+  } else {
+    const inviteStatus = inviteRes.status;
+    if (inviteStatus === 422 || inviteStatus === 400) {
+      await inviteRes.text(); // consume body
+      shouldFallbackToChat = true;
+    } else {
+      const errData = await inviteRes.json().catch(() => null);
+      return { success: false, error: errData?.error || errData?.message || inviteRes.statusText };
+    }
   }
 
-  // 422 = already connected, 400 = message too long — fall back to chat
-  const inviteStatus = inviteRes.status;
-  if (inviteStatus === 422 || inviteStatus === 400) {
-    await inviteRes.text(); // consume body
+  if (shouldFallbackToChat) {
 
     // Search existing chats by page (max 50 chats = 3 pages of 20)
     let resolvedChatId: string | undefined;
@@ -227,8 +238,4 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
       raw: newChatData,
     };
   }
-
-  // Other error
-  const errData = await inviteRes.json().catch(() => null);
-  return { success: false, error: errData?.error || errData?.message || inviteRes.statusText };
 }

@@ -631,6 +631,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
         } else if (conditionType === 'check_connection' && accountId) {
           let isContact = false;
           let relationError: string | undefined;
+          let checkProviderId: string | undefined;
 
           try {
             // Resolve the contact's LinkedIn URL
@@ -645,7 +646,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
             } else {
               const { data: accountRow } = await supabase
                 .from('unipile_accounts')
-                .select('provider_account_id, status')
+                .select('provider_account_id, account_id, status')
                 .eq('id', accountId)
                 .single();
 
@@ -653,6 +654,9 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
                 relationError = `Account not found or not active: ${accountId}`;
               } else {
                 const apiUrl = config.unipile.apiUrl;
+                const unipileAccountId = accountRow.account_id;
+
+                // Check connection via Relation API
                 const res = await unipileFetch(
                   `${apiUrl}/api/v1/users/${accountRow.provider_account_id}/relation/${linkedinProfileId}`,
                   { headers: { 'X-API-KEY': config.unipile.apiKey } }
@@ -663,6 +667,44 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
                   relationError = data?.error || `Relation API failed: ${res.status}`;
                 } else {
                   isContact = data?.is_contact === true;
+                }
+
+                // When connected, resolve provider_id and find existing chat_id
+                if (isContact && unipileAccountId) {
+                  try {
+                    const profileRes = await unipileFetch(
+                      `${apiUrl}/api/v1/users/${linkedinProfileId}?account_id=${unipileAccountId}`,
+                      { headers: { 'X-API-KEY': config.unipile.apiKey } }
+                    );
+                    const profileData = await profileRes.json().catch(() => null);
+                    checkProviderId = profileData?.id || profileData?.provider_id;
+
+                    if (checkProviderId) {
+                      // Search chats: max 100, 5 pages of 20
+                      const pageSize = 20;
+                      let page = 1;
+                      let fetched = 0;
+
+                      while (fetched < 100) {
+                        const chatsUrl = `${apiUrl}/api/v1/chats?account_id=${unipileAccountId}&provider=LINKEDIN&limit=${pageSize}&page=${page}`;
+                        const chatsRes = await unipileFetch(chatsUrl, { headers: { 'X-API-KEY': config.unipile.apiKey } });
+                        const chatsData = await chatsRes.json().catch(() => null);
+                        const chats: any[] = chatsData?.items || chatsData?.chats || [];
+
+                        const match = chats.find((c: any) => c.attendee_provider_id === checkProviderId);
+                        if (match) {
+                          chatId = match.id;
+                          break;
+                        }
+
+                        fetched += chats.length;
+                        if (chats.length < pageSize) break;
+                        page++;
+                      }
+                    }
+                  } catch (chatErr: any) {
+                    console.warn(`[check_connection] Chat lookup failed (non-critical):`, chatErr.message);
+                  }
                 }
               }
             }
@@ -684,6 +726,8 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
             response_data: {
               condition_result: isContact ? 'yes' : 'no',
               is_contact: isContact,
+              provider_id: checkProviderId || null,
+              chat_id: chatId || null,
               ...(relationError ? { error: relationError } : {}),
             },
           });
