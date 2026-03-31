@@ -919,7 +919,31 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     });
   }
 
-  // 14. Update chat_id on execution if available
+  // 14. Insert message_sent event for email steps (powers inbox/unibox display)
+  if (stepSuccess && currentStep.step_type === 'email' && stepResult) {
+    await supabase.from('unipile_message_events').insert({
+      event_type: 'message_sent',
+      unipile_sequence_id: (execution as any).unipile_sequence_id,
+      execution_id,
+      lead_id: (execution as any).lead_id || null,
+      contact_id: (execution as any).contact_id || null,
+      original_client_id: sequence?.client_id || null,
+      receiving_account_id: assignedEmailAccountId,
+      unipile_message_id: stepResult.provider_id || stepResult.tracking_id || null,
+      unipile_chat_id: null,
+      message_text: stepResult.body || null,
+      is_read: true,
+      event_data: {
+        step_type: 'email',
+        step_id: currentStep.id,
+        subject: stepResult.subject || null,
+        provider_id: stepResult.provider_id || null,
+        automated: true,
+      },
+    });
+  }
+
+  // 15. Update chat_id on execution if available
   if (stepResult?.chat_id && stepResult.chat_id !== (execution as any).chat_id) {
     await supabase.from('unipile_sequence_executions')
       .update({ chat_id: stepResult.chat_id })
