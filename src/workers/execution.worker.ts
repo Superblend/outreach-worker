@@ -202,6 +202,15 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     return;
   }
 
+  // Claim execution for processing (prevents duplicate sends across concurrent workers)
+  const { data: claimed } = await supabase.rpc('claim_execution_for_processing', { p_execution_id: execution_id });
+  if (!claimed) {
+    console.log(`⏭️ Execution ${execution_id} already claimed by another worker, skipping`);
+    return;
+  }
+
+  try {
+
   // 3. Load all steps
   const { data: allSteps } = await supabase
     .from('unipile_sequence_steps')
@@ -1076,13 +1085,17 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     .eq('id', execution_id);
 
   console.log(`➡️ Execution ${execution_id} advanced to step ${nextStepId}`);
+
+  } finally {
+    await supabase.rpc('release_execution_claim', { p_execution_id: execution_id, p_new_state: 'not_started' });
+  }
 }
 
 export function startExecutionWorker() {
   const supabaseRef = config.supabase.url.match(/https?:\/\/([^.]+)/)?.[1] || 'unknown';
   console.log(`🔗 Supabase project ref: ${supabaseRef}`);
 
-  const stepResultWriter = new BatchWriter(supabase, 'unipile_step_results');
+  const stepResultWriter = new BatchWriter(supabase, 'unipile_step_results', { onConflict: 'execution_id,step_id' });
 
   const worker = new Worker<ExecutionJobData>(
     'outreach-executions',

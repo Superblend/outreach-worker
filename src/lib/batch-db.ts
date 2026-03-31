@@ -5,10 +5,12 @@ export class BatchWriter {
   private flushTimer: NodeJS.Timeout | null = null;
   private tableName: string;
   private supabase: SupabaseClient;
+  private onConflict?: string;
 
-  constructor(supabase: SupabaseClient, tableName: string) {
+  constructor(supabase: SupabaseClient, tableName: string, options?: { onConflict?: string }) {
     this.supabase = supabase;
     this.tableName = tableName;
+    this.onConflict = options?.onConflict;
   }
 
   async add(record: any) {
@@ -24,7 +26,9 @@ export class BatchWriter {
     if (this.buffer.length === 0) return;
     const batch = this.buffer.splice(0, this.buffer.length);
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
-    const { error } = await this.supabase.from(this.tableName).insert(batch);
-    if (error) console.error(`Batch insert to ${this.tableName} failed:`, error, 'payload keys:', Object.keys(batch[0] || {}));
+    const { error } = this.onConflict
+      ? await this.supabase.from(this.tableName).upsert(batch, { onConflict: this.onConflict, ignoreDuplicates: true })
+      : await this.supabase.from(this.tableName).insert(batch);
+    if (error) console.error(`Batch write to ${this.tableName} failed:`, error, 'payload keys:', Object.keys(batch[0] || {}));
   }
 }

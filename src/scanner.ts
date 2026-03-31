@@ -158,7 +158,7 @@ async function scanAndEnqueue() {
             delay: Math.round(delay),
             attempts: 3,
             backoff: { type: 'exponential', delay: 5000 },
-            jobId: `exec:${exec.id}:${Date.now()}`, // Unique per scan cycle
+            jobId: `exec:${exec.id}:${exec.current_step_id}`,
             removeOnComplete: { age: 3600, count: 1000 },
             removeOnFail: { age: 86400, count: 5000 },
           }
