@@ -61,11 +61,18 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
       return { success: false, error: data?.error || data?.message || res.statusText };
     }
 
+    if (!data?.id) {
+      return { success: false, error: 'Message sent but no id returned' };
+    }
+
     return {
       success: true,
-      message_id: data?.id,
+      message_id: data.id,
       chat_id,
+      provider_id: null,
+      public_identifier: null,
       personalized_message: personalizedMessage,
+      raw: data,
     };
   }
 
@@ -107,34 +114,40 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
 
   if (inviteRes.ok) {
     const inviteData = await inviteRes.json().catch(() => null);
+
+    if (!inviteData?.id) {
+      return { success: false, error: 'Invite sent but no id returned' };
+    }
+
     return {
       success: true,
-      message_id: inviteData?.id,
+      invitation_id: inviteData.id,
       provider_id: providerId,
       public_identifier: publicIdentifier,
       personalized_message: personalizedMessage,
+      raw: inviteData,
     };
   }
 
-  // If 422 (already connected), search existing chats
-  if (inviteRes.status === 422) {
+  // 422 = already connected, 400 = message too long — fall back to chat
+  const inviteStatus = inviteRes.status;
+  if (inviteStatus === 422 || inviteStatus === 400) {
     await inviteRes.text(); // consume body
 
+    // Search existing chats by page (max 50 chats = 3 pages of 20)
     let resolvedChatId: string | undefined;
-    let cursor: string | undefined;
-    let fetched = 0;
     const maxChats = 50;
     const pageSize = 20;
+    let page = 1;
+    let fetched = 0;
 
     while (fetched < maxChats) {
-      const url = `${apiUrl}/api/v1/chats?account_id=${unipileAccountId}&limit=${pageSize}${cursor ? `&cursor=${cursor}` : ''}`;
+      const url = `${apiUrl}/api/v1/chats?account_id=${unipileAccountId}&page=${page}&limit=${pageSize}`;
       const chatsRes = await unipileFetch(url, { headers: { 'X-API-KEY': config.unipile.apiKey } });
       const chatsData = await chatsRes.json().catch(() => null);
-      const chats = chatsData?.items || chatsData?.chats || [];
+      const chats: any[] = chatsData?.items || chatsData?.chats || [];
 
-      const match = chats.find((c: any) =>
-        c.attendees?.some((a: any) => a.provider_id === providerId)
-      );
+      const match = chats.find((c: any) => c.attendee_provider_id === providerId);
 
       if (match) {
         resolvedChatId = match.id;
@@ -142,12 +155,11 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
       }
 
       fetched += chats.length;
-      cursor = chatsData?.cursor || chatsData?.next_cursor;
-      if (!cursor || chats.length < pageSize) break;
+      if (chats.length < pageSize) break;
+      page++;
     }
 
     if (resolvedChatId) {
-      // Send via found chat
       const msgRes = await unipileFetch(`${apiUrl}/api/v1/chats/${resolvedChatId}/messages`, {
         method: 'POST',
         headers: {
@@ -166,13 +178,18 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
         return { success: false, error: msgData?.error || msgData?.message || msgRes.statusText };
       }
 
+      if (!msgData?.id) {
+        return { success: false, error: 'Message sent but no id returned' };
+      }
+
       return {
         success: true,
-        message_id: msgData?.id,
+        message_id: msgData.id,
         chat_id: resolvedChatId,
         provider_id: providerId,
         public_identifier: publicIdentifier,
         personalized_message: personalizedMessage,
+        raw: msgData,
       };
     }
 
@@ -196,13 +213,18 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
       return { success: false, error: newChatData?.error || newChatData?.message || newChatRes.statusText };
     }
 
+    if (!newChatData?.id) {
+      return { success: false, error: 'Chat created but no id returned' };
+    }
+
     return {
       success: true,
-      message_id: newChatData?.id,
-      chat_id: newChatData?.chat_id || newChatData?.id,
+      message_id: newChatData.id,
+      chat_id: newChatData.chat_id || newChatData.id,
       provider_id: providerId,
       public_identifier: publicIdentifier,
       personalized_message: personalizedMessage,
+      raw: newChatData,
     };
   }
 

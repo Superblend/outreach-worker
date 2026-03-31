@@ -816,6 +816,19 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     };
   }
 
+  if (currentStep.step_type === 'linkedin_message') {
+    resultRecord.unipile_message_id = stepResult?.invitation_id || stepResult?.message_id || null;
+    resultRecord.response_data = stepResult ? {
+      chat_id: stepResult.chat_id || null,
+      message_id: stepResult.message_id || null,
+      invitation_id: stepResult.invitation_id || null,
+      provider_id: stepResult.provider_id || null,
+      public_identifier: stepResult.public_identifier || null,
+      personalized_message: stepResult.personalized_message || null,
+      ...(stepError ? { error: stepError } : {}),
+    } : { error: stepError || null };
+  }
+
   await stepResultWriter.add(resultRecord);
 
   // 13. Rollback daily limit on failure
