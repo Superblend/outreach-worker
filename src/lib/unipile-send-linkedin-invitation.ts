@@ -58,11 +58,12 @@ export async function sendLinkedInInvitation(params: SendLinkedInInvitationParam
     return { success: false, error: profileData?.error || profileData?.message || `Profile fetch failed: ${profileRes.status}` };
   }
 
-  const providerId = profileData?.id || profileData?.provider_id;
+  const providerId = profileData?.provider_id || null;
   if (!providerId) {
     return { success: false, error: 'Could not get provider_id from LinkedIn profile' };
   }
 
+  const resolvedProfileUrl = lead.linkedin || lead.linkedin_url || null;
   const personalizedMessage = params.message ? normalizeAndReplace(params.message, lead) : '';
 
   // Send invitation
@@ -83,8 +84,18 @@ export async function sendLinkedInInvitation(params: SendLinkedInInvitationParam
 
   if (!inviteRes.ok) {
     const errorMsg = inviteData?.error || inviteData?.message || inviteRes.statusText;
-    return { success: false, error: errorMsg };
+    // Return partial data even on failure so webhook can match if a delayed acceptance arrives
+    return {
+      success: false,
+      error: errorMsg,
+      provider_id: providerId,
+      public_identifier: publicIdentifier,
+      resolved_profile_url: resolvedProfileUrl,
+      sent_from_unipile_account: unipileAccountId,
+    };
   }
+
+  const invitationId = inviteData?.id || inviteData?.invitation_id || null;
 
   // Try to fetch chat_id (non-critical)
   let chatId: string | undefined;
@@ -94,10 +105,8 @@ export async function sendLinkedInInvitation(params: SendLinkedInInvitationParam
       { headers: { 'X-API-KEY': config.unipile.apiKey } }
     );
     const chatsData = await chatsRes.json().catch(() => null);
-    const chats = chatsData?.items || chatsData?.chats || [];
-    const matchedChat = chats.find((c: any) =>
-      c.attendees?.some((a: any) => a.provider_id === providerId)
-    );
+    const chats = chatsData?.items || [];
+    const matchedChat = chats.find((c: any) => c.attendee_provider_id === providerId);
     if (matchedChat) chatId = matchedChat.id;
   } catch {
     // Non-critical, ignore
@@ -105,10 +114,12 @@ export async function sendLinkedInInvitation(params: SendLinkedInInvitationParam
 
   return {
     success: true,
+    invitation_id: invitationId,
+    chat_id: chatId || null,
     provider_id: providerId,
     public_identifier: publicIdentifier,
+    resolved_profile_url: resolvedProfileUrl,
     sent_from_unipile_account: unipileAccountId,
-    chat_id: chatId,
     personalized_message: personalizedMessage,
   };
 }

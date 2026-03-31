@@ -459,8 +459,10 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
           message: cfg.message_body || cfg.message || '',
         });
 
+        // Always capture result so webhook fields are persisted even on failure
+        stepResult = result;
+
         if (result.success) {
-          stepResult = result;
           nextStepId = await getNextStepId(currentStep.id);
         } else {
           stepError = result.error || 'Unknown error';
@@ -865,6 +867,20 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
       subject: stepResult.subject,
       is_follow_up: !!stepResult.was_reply,
       reply_to: stepResult.in_reply_to_message_id,
+    };
+  }
+
+  if (currentStep.step_type === 'linkedin_invitation') {
+    resultRecord.unipile_message_id = stepResult?.invitation_id || null;
+    resultRecord.response_data = {
+      invitation_id: stepResult?.invitation_id || null,
+      chat_id: stepResult?.chat_id || null,
+      provider_id: stepResult?.provider_id || null,
+      public_identifier: stepResult?.public_identifier || null,
+      resolved_profile_url: stepResult?.resolved_profile_url || null,
+      sent_from_unipile_account: stepResult?.sent_from_unipile_account || null,
+      personalized_message: stepResult?.personalized_message || null,
+      ...(stepError ? { error: stepError } : {}),
     };
   }
 
