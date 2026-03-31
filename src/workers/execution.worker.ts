@@ -8,6 +8,7 @@ import { sendLinkedInMessage } from '../lib/unipile-send-linkedin-message';
 import { visitProfile } from '../lib/unipile-visit-profile';
 import { checkConnection } from '../lib/unipile-check-connection';
 import { unipileFetch } from '../lib/unipile-fetch';
+import { engagePost } from '../lib/unipile-engage-post';
 import { BatchWriter } from '../lib/batch-db';
 
 interface ExecutionJobData {
@@ -803,12 +804,19 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
       }
 
       case 'linkedin_engage_post': {
-        const { data: efResult, error: efError } = await invokeEdgeFunction('unipile-engage-post', {
-          execution_id,
-          step_id: currentStep.id,
+        const cfg = currentStep.configuration || {};
+        const accountId = assignedLinkedInAccountId || cfg.account_id;
+        if (!accountId) throw new Error('Missing required LinkedIn account');
+
+        const result = await engagePost({
+          account_id: accountId,
+          lead,
+          action_type: cfg.action_type || 'like',
+          comment_text: cfg.comment_text,
         });
-        stepResult = efResult;
-        if (efError) stepError = efError.message || 'Engage post failed';
+
+        stepResult = result;
+        if (!result.success) stepError = result.error || 'Engage post failed';
         nextStepId = await getNextStepId(currentStep.id);
         break;
       }
@@ -857,6 +865,18 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
       subject: stepResult.subject,
       is_follow_up: !!stepResult.was_reply,
       reply_to: stepResult.in_reply_to_message_id,
+    };
+  }
+
+  if (currentStep.step_type === 'linkedin_engage_post') {
+    resultRecord.response_data = {
+      provider_id: stepResult?.provider_id || null,
+      post_id: stepResult?.post_id || null,
+      action: stepResult?.action || null,
+      post_preview: stepResult?.post_preview || null,
+      ...(stepResult?.comment_text ? { comment_text: stepResult.comment_text } : {}),
+      ...(stepResult?.skipped ? { skipped: true, reason: stepResult.reason } : {}),
+      ...(stepError ? { error: stepError } : {}),
     };
   }
 
