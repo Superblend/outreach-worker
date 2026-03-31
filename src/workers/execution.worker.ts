@@ -861,7 +861,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   }
 
   if (currentStep.step_type === 'linkedin_message') {
-    resultRecord.unipile_message_id = stepResult?.invitation_id || stepResult?.message_id || null;
+    resultRecord.unipile_message_id = stepResult?.message_id || stepResult?.invitation_id || null;
     resultRecord.response_data = stepResult ? {
       chat_id: stepResult.chat_id || null,
       message_id: stepResult.message_id || null,

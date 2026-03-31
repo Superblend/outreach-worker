@@ -12,18 +12,18 @@ interface SendLinkedInMessageParams {
 }
 
 function extractLinkedInIdentifier(lead: any): string | null {
-  const url = lead.linkedin_url || lead.linkedin || '';
+  const url = lead.linkedin || lead.linkedin_url || '';
   if (!url) return null;
-  const match = url.match(/linkedin\.com\/in\/([^/?#]+)/i);
-  if (match) return match[1];
-  if (!url.includes('/') && !url.includes('.')) return url;
+  const match = url.match(/linkedin\.com\/in\/([^/?]+)/);
+  if (match && match[1]) return match[1].replace(/\/$/, '');
   return null;
 }
 
 export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Promise<any> {
-  const { account_id, lead, use_inmail, chat_id } = params;
+  const { account_id, lead, use_inmail } = params;
   const apiUrl = config.unipile.apiUrl;
 
+  // Resolve the Unipile account
   const { data: accountRow, error: accountError } = await supabase
     .from('unipile_accounts')
     .select('account_id, status')
@@ -39,80 +39,49 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
   }
 
   const unipileAccountId = accountRow.account_id;
-  const personalizedMessage = normalizeAndReplace(params.message, lead);
+  const personalizedMessage = normalizeAndReplace(params.message || '', lead);
 
-  // If chat_id provided, send directly
-  if (chat_id) {
-    const res = await unipileFetch(`${apiUrl}/api/v1/chats/${chat_id}/messages`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-KEY': config.unipile.apiKey,
-      },
-      body: JSON.stringify({
-        text: personalizedMessage,
-        type: use_inmail ? 'INMAIL' : 'MESSAGE',
-      }),
+  // Step 3: If a chat_id is already known, skip straight to send
+  const existingChatId = params.chat_id;
+  if (existingChatId) {
+    return sendToChat({
+      apiUrl, unipileAccountId, chatId: existingChatId,
+      personalizedMessage, use_inmail,
+      providerId: null, publicIdentifier: null,
     });
-
-    const data = await res.json().catch(() => null);
-
-    if (!res.ok) {
-      return { success: false, error: data?.error || data?.message || res.statusText };
-    }
-
-    if (!data?.id) {
-      return { success: false, error: 'Message sent but no id returned' };
-    }
-
-    return {
-      success: true,
-      message_id: data.id,
-      chat_id,
-      provider_id: null,
-      public_identifier: null,
-      personalized_message: personalizedMessage,
-      raw: data,
-    };
   }
 
-  // No chat_id: resolve via LinkedIn identifier
+  // Step 1: Resolve provider_id from LinkedIn profile
   const publicIdentifier = extractLinkedInIdentifier(lead);
   if (!publicIdentifier) {
-    return { success: false, error: 'Missing required LinkedIn URL on lead' };
+    return { success: false, error: 'Missing LinkedIn URL on lead' };
   }
 
-  // Fetch profile for provider_id
   const profileRes = await unipileFetch(
     `${apiUrl}/api/v1/users/${publicIdentifier}?account_id=${unipileAccountId}`,
     { headers: { 'X-API-KEY': config.unipile.apiKey } }
   );
-  const profileData = await profileRes.json().catch(() => null);
 
   if (!profileRes.ok) {
-    return { success: false, error: profileData?.error || `Profile fetch failed: ${profileRes.status}` };
+    const errText = await profileRes.text().catch(() => '');
+    let errMsg = `Profile fetch failed (${profileRes.status})`;
+    try { errMsg = JSON.parse(errText)?.message || JSON.parse(errText)?.error || errMsg; } catch {}
+    return { success: false, error: errMsg };
   }
 
-  const providerId = profileData?.id || profileData?.provider_id;
+  const profileData = await profileRes.json().catch(() => null);
+  const providerId: string | null = profileData?.provider_id || null;
+
   if (!providerId) {
     return { success: false, error: 'Could not get provider_id from LinkedIn profile' };
   }
 
-  // Try invite endpoint first
+  // Step 4: Try invite endpoint
   const inviteRes = await unipileFetch(`${apiUrl}/api/v1/users/invite`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-KEY': config.unipile.apiKey,
-    },
-    body: JSON.stringify({
-      account_id: unipileAccountId,
-      provider_id: providerId,
-      message: personalizedMessage,
-    }),
+    headers: { 'Content-Type': 'application/json', 'X-API-KEY': config.unipile.apiKey },
+    body: JSON.stringify({ account_id: unipileAccountId, provider_id: providerId, message: personalizedMessage }),
   });
-
-  let shouldFallbackToChat = false;
 
   if (inviteRes.ok) {
     const inviteData = await inviteRes.json().catch(() => null);
@@ -125,117 +94,104 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
         provider_id: providerId,
         public_identifier: publicIdentifier,
         personalized_message: personalizedMessage,
-        raw: inviteData,
       };
     }
 
-    // 2xx but no usable ID — fall through to chat-based send
-    console.warn(`[linkedin_message] Invite returned 2xx but no ID for ${publicIdentifier}, falling back to chat`);
-    shouldFallbackToChat = true;
+    // 2xx but no usable ID — fall through to chat
+    console.warn(`[linkedin_message] Invite 2xx but no ID for ${publicIdentifier}, falling back to chat`);
   } else {
     const inviteStatus = inviteRes.status;
-    if (inviteStatus === 422 || inviteStatus === 400) {
-      await inviteRes.text(); // consume body
-      shouldFallbackToChat = true;
-    } else {
-      const errData = await inviteRes.json().catch(() => null);
-      return { success: false, error: errData?.error || errData?.message || inviteRes.statusText };
+    await inviteRes.text(); // consume body
+
+    if (inviteStatus !== 422 && inviteStatus !== 400) {
+      // Non-recoverable error
+      return { success: false, error: `Invite failed (${inviteStatus})` };
     }
+    // 422 = already connected, 400 = message too long — fall through to chat
   }
 
-  if (shouldFallbackToChat) {
+  // Step 5: Chat lookup fallback (max 3 pages × 20 = 60 chats)
+  let resolvedChatId: string | undefined;
+  for (let page = 1; page <= 3; page++) {
+    const chatsRes = await unipileFetch(
+      `${apiUrl}/api/v1/chats?account_id=${unipileAccountId}&limit=20&page=${page}`,
+      { headers: { 'X-API-KEY': config.unipile.apiKey } }
+    );
 
-    // Search existing chats by page (max 50 chats = 3 pages of 20)
-    let resolvedChatId: string | undefined;
-    const maxChats = 50;
-    const pageSize = 20;
-    let page = 1;
-    let fetched = 0;
+    if (!chatsRes.ok) break;
 
-    while (fetched < maxChats) {
-      const url = `${apiUrl}/api/v1/chats?account_id=${unipileAccountId}&page=${page}&limit=${pageSize}`;
-      const chatsRes = await unipileFetch(url, { headers: { 'X-API-KEY': config.unipile.apiKey } });
-      const chatsData = await chatsRes.json().catch(() => null);
-      const chats: any[] = chatsData?.items || chatsData?.chats || [];
+    const chatsData = await chatsRes.json().catch(() => null);
+    const chats: any[] = chatsData?.items || [];
 
-      const match = chats.find((c: any) => c.attendee_provider_id === providerId);
-
-      if (match) {
-        resolvedChatId = match.id;
-        break;
-      }
-
-      fetched += chats.length;
-      if (chats.length < pageSize) break;
-      page++;
+    const match = chats.find((c: any) => c.attendee_provider_id === providerId);
+    if (match) {
+      resolvedChatId = match.id;
+      break;
     }
 
-    if (resolvedChatId) {
-      const msgRes = await unipileFetch(`${apiUrl}/api/v1/chats/${resolvedChatId}/messages`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-KEY': config.unipile.apiKey,
-        },
-        body: JSON.stringify({
-          text: personalizedMessage,
-          type: use_inmail ? 'INMAIL' : 'MESSAGE',
-        }),
-      });
+    if (chats.length < 20) break; // last page
+  }
 
-      const msgData = await msgRes.json().catch(() => null);
-
-      if (!msgRes.ok) {
-        return { success: false, error: msgData?.error || msgData?.message || msgRes.statusText };
-      }
-
-      if (!msgData?.id) {
-        return { success: false, error: 'Message sent but no id returned' };
-      }
-
-      return {
-        success: true,
-        message_id: msgData.id,
-        chat_id: resolvedChatId,
-        provider_id: providerId,
-        public_identifier: publicIdentifier,
-        personalized_message: personalizedMessage,
-        raw: msgData,
-      };
-    }
-
-    // No chat found: create new chat
-    const newChatRes = await unipileFetch(`${apiUrl}/api/v1/chats`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-KEY': config.unipile.apiKey,
-      },
-      body: JSON.stringify({
-        account_id: unipileAccountId,
-        text: personalizedMessage,
-        attendees_ids: [providerId],
-      }),
+  if (resolvedChatId) {
+    // Step 6: Send to found chat
+    return sendToChat({
+      apiUrl, unipileAccountId, chatId: resolvedChatId,
+      personalizedMessage, use_inmail, providerId, publicIdentifier,
     });
-
-    const newChatData = await newChatRes.json().catch(() => null);
-
-    if (!newChatRes.ok) {
-      return { success: false, error: newChatData?.error || newChatData?.message || newChatRes.statusText };
-    }
-
-    if (!newChatData?.id) {
-      return { success: false, error: 'Chat created but no id returned' };
-    }
-
-    return {
-      success: true,
-      message_id: newChatData.id,
-      chat_id: newChatData.chat_id || newChatData.id,
-      provider_id: providerId,
-      public_identifier: publicIdentifier,
-      personalized_message: personalizedMessage,
-      raw: newChatData,
-    };
   }
+
+  // No chat found — create new chat
+  const newChatRes = await unipileFetch(`${apiUrl}/api/v1/chats`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-KEY': config.unipile.apiKey },
+    body: JSON.stringify({ account_id: unipileAccountId, text: personalizedMessage, attendees_ids: [providerId] }),
+  });
+
+  const newChatData = await newChatRes.json().catch(() => null);
+
+  if (!newChatRes.ok) {
+    return { success: false, error: newChatData?.message || newChatData?.error || `Chat create failed (${newChatRes.status})` };
+  }
+
+  return {
+    success: true,
+    message_id: newChatData?.id || null,
+    chat_id: newChatData?.chat_id || null,
+    provider_id: providerId,
+    public_identifier: publicIdentifier,
+    personalized_message: personalizedMessage,
+  };
+}
+
+async function sendToChat(opts: {
+  apiUrl: string;
+  unipileAccountId: string;
+  chatId: string;
+  personalizedMessage: string;
+  use_inmail?: boolean;
+  providerId: string | null;
+  publicIdentifier: string | null;
+}): Promise<any> {
+  const { apiUrl, chatId, personalizedMessage, use_inmail, providerId, publicIdentifier } = opts;
+
+  const res = await unipileFetch(`${apiUrl}/api/v1/chats/${chatId}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-KEY': config.unipile.apiKey },
+    body: JSON.stringify({ text: personalizedMessage, type: use_inmail ? 'INMAIL' : 'MESSAGE' }),
+  });
+
+  const data = await res.json().catch(() => null);
+
+  if (!res.ok) {
+    return { success: false, error: data?.message || data?.error || `Chat send failed (${res.status})` };
+  }
+
+  return {
+    success: true,
+    message_id: data?.id || null,
+    chat_id: chatId,
+    provider_id: providerId,
+    public_identifier: publicIdentifier,
+    personalized_message: personalizedMessage,
+  };
 }
