@@ -111,7 +111,7 @@ async function enforceTimeWindow(proposedTime: Date, sequence: any): Promise<Dat
 async function smartReschedule(
   execution: any,
   accountId: string,
-  limitType: string,
+  messageType: string,
   defaultLimit: number,
 ): Promise<string> {
   const sequence = execution.unipile_sequences as any;
@@ -130,8 +130,8 @@ async function smartReschedule(
 
     const { data: limitCheck } = await supabase.rpc('check_and_increment_daily_limit', {
       p_account_id: accountId,
-      p_limit_type: limitType,
-      p_daily_max: defaultLimit,
+      p_message_type: messageType,
+      p_max_default: defaultLimit,
     });
 
     if (limitCheck && !limitCheck.allowed) continue;
@@ -385,27 +385,27 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
 
   // 9. Daily limit check
   let preIncrementedAccountId: string | null = null;
-  let preIncrementedLimitType: string | null = null;
+  let preIncrementedMessageType: string | null = null;
 
   if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
-    const limitType = currentStep.step_type === 'email' ? 'email'
-      : currentStep.step_type === 'linkedin_invitation' ? 'linkedin_invitation' : 'linkedin_message';
+    const messageType = currentStep.step_type === 'email' ? 'emails'
+      : currentStep.step_type === 'linkedin_invitation' ? 'linkedin_invitations' : 'linkedin_messages';
 
     const accountId = currentStep.step_type === 'email'
       ? (assignedEmailAccountId || currentStep.configuration?.account_id)
       : (assignedLinkedInAccountId || currentStep.configuration?.account_id);
 
-    const defaultLimit = limitType === 'linkedin_invitation' ? 30 : 50;
+    const defaultLimit = messageType === 'linkedin_invitations' ? 30 : 50;
 
     if (accountId) {
       const { data: limitResult } = await supabase.rpc('check_and_increment_daily_limit', {
         p_account_id: accountId,
-        p_limit_type: limitType,
-        p_daily_max: currentStep.configuration?.daily_limit || defaultLimit,
+        p_message_type: messageType,
+        p_max_default: currentStep.configuration?.daily_limit || defaultLimit,
       });
 
       if (limitResult && !limitResult.allowed) {
-        const nextTime = await smartReschedule(execution, accountId, limitType, defaultLimit);
+        const nextTime = await smartReschedule(execution, accountId, messageType, defaultLimit);
         await supabase.from('unipile_sequence_executions')
           .update({ next_execution_at: nextTime, updated_at: new Date().toISOString() })
           .eq('id', execution_id);
@@ -415,7 +415,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
 
       if (limitResult?.allowed) {
         preIncrementedAccountId = accountId;
-        preIncrementedLimitType = limitType;
+        preIncrementedMessageType = messageType;
       }
     }
   }
@@ -477,7 +477,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
               if (preIncrementedAccountId) {
                 await supabase.rpc('rollback_daily_limit_increment', {
                   p_account_id: preIncrementedAccountId,
-                  p_limit_type: preIncrementedLimitType,
+                  p_message_type: preIncrementedMessageType,
                 });
               }
               return;
@@ -914,7 +914,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   if (!stepSuccess && preIncrementedAccountId) {
     await supabase.rpc('rollback_daily_limit_increment', {
       p_account_id: preIncrementedAccountId,
-      p_limit_type: preIncrementedLimitType,
+      p_message_type: preIncrementedMessageType,
     });
   }
 
