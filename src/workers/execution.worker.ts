@@ -198,8 +198,11 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   }
 
   if (sequence?.status === 'paused') {
-    console.log(`⏸️ Sequence paused for execution ${execution_id}`);
-    return;
+    await supabase.from('unipile_sequence_executions')
+      .update({ status: 'paused', updated_at: new Date().toISOString() })
+      .eq('id', execution_id);
+    console.log(`⏸️ Execution ${execution_id} paused (sequence paused)`);
+    return; // No claim acquired, no release needed
   }
 
   // Claim execution for processing (prevents duplicate sends across concurrent workers)
