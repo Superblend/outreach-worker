@@ -7,6 +7,7 @@ import { sendLinkedInInvitation } from '../lib/unipile-send-linkedin-invitation'
 import { sendLinkedInMessage } from '../lib/unipile-send-linkedin-message';
 import { visitProfile } from '../lib/unipile-visit-profile';
 import { checkConnection } from '../lib/unipile-check-connection';
+import { unipileFetch } from '../lib/unipile-fetch';
 import { BatchWriter } from '../lib/batch-db';
 
 interface ExecutionJobData {
@@ -627,6 +628,65 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
           const connResult = await checkConnection({ account_id: accountId, lead });
           conditionMet = connResult.connected;
           chatId = connResult.chat_id;
+        } else if (conditionType === 'check_connection' && accountId) {
+          let isContact = false;
+          let relationError: string | undefined;
+
+          try {
+            // Resolve the contact's LinkedIn URL
+            const linkedInUrl: string | null =
+              lead?.linkedin || lead?.linkedin_url || null;
+
+            const profileIdMatch = linkedInUrl?.match(/linkedin\.com\/in\/([^/?#]+)/i);
+            const linkedinProfileId = profileIdMatch ? profileIdMatch[1] : null;
+
+            if (!linkedinProfileId) {
+              relationError = 'No LinkedIn URL found for contact';
+            } else {
+              const { data: accountRow } = await supabase
+                .from('unipile_accounts')
+                .select('provider_account_id, status')
+                .eq('id', accountId)
+                .single();
+
+              if (!accountRow || accountRow.status !== 'active') {
+                relationError = `Account not found or not active: ${accountId}`;
+              } else {
+                const apiUrl = config.unipile.apiUrl;
+                const res = await unipileFetch(
+                  `${apiUrl}/api/v1/users/${accountRow.provider_account_id}/relation/${linkedinProfileId}`,
+                  { headers: { 'X-API-KEY': config.unipile.apiKey } }
+                );
+                const data = await res.json().catch(() => null);
+
+                if (!res.ok) {
+                  relationError = data?.error || `Relation API failed: ${res.status}`;
+                } else {
+                  isContact = data?.is_contact === true;
+                }
+              }
+            }
+          } catch (err: any) {
+            relationError = err.message || 'Unexpected error during check_connection';
+            console.error(`❌ check_connection error for ${execution_id}:`, err);
+          }
+
+          conditionMet = isContact;
+
+          await stepResultWriter.add({
+            execution_id,
+            step_id: currentStep.id,
+            lead_id: (execution as any).lead_id,
+            contact_id: (execution as any).contact_id,
+            step_type: 'conditional',
+            status: 'success',
+            error_message: null,
+            response_data: {
+              condition_result: isContact ? 'yes' : 'no',
+              is_contact: isContact,
+              ...(relationError ? { error: relationError } : {}),
+            },
+          });
         }
 
         const handle = conditionMet ? 'yes' : 'no';
