@@ -191,33 +191,47 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   // Resolve entity (lead or contact) by explicit query
   const leadId = (execution as any).lead_id;
   const contactId = (execution as any).contact_id;
-  console.log(`🔍 Resolving entity: lead_id=${leadId}, contact_id=${contactId}`);
+  console.log(`🔍 [${execution_id}] Resolving entity: lead_id=${leadId}, contact_id=${contactId}`);
 
   let lead: any;
   if (leadId) {
     const { data: leadData, error: leadErr } = await supabase
       .from('leads')
-      .select('first_name, last_name, email, linkedin, company, position')
+      .select('first_name, last_name, email, linkedin, company, position, industry')
       .eq('id', leadId)
       .single();
-    if (leadErr) console.error(`❌ Failed to fetch lead ${leadId}:`, leadErr.message);
+    if (leadErr) {
+      console.error(`❌ [${execution_id}] Failed to fetch lead ${leadId}:`, leadErr.message);
+    }
     lead = leadData;
   } else if (contactId) {
     const { data: contactData, error: contactErr } = await supabase
       .from('contacts')
-      .select('first_name, last_name, email, linkedin, company, position')
+      .select('first_name, last_name, email, linkedin, company, position, industry')
       .eq('id', contactId)
       .single();
-    if (contactErr) console.error(`❌ Failed to fetch contact ${contactId}:`, contactErr.message);
+    if (contactErr) {
+      console.error(`❌ [${execution_id}] Failed to fetch contact ${contactId}:`, contactErr.message);
+    }
     lead = contactData;
   } else {
-    throw new Error(`Execution ${execution_id} has neither lead_id nor contact_id`);
+    const msg = `Execution has neither lead_id nor contact_id`;
+    console.error(`❌ [${execution_id}] ${msg}`);
+    await supabase.from('unipile_sequence_executions')
+      .update({ status: 'failed', error_message: msg, updated_at: new Date().toISOString() })
+      .eq('id', execution_id);
+    return;
   }
 
   if (!lead) {
-    throw new Error(`Execution ${execution_id}: entity not found (lead_id=${leadId}, contact_id=${contactId})`);
+    const msg = `Entity not found (lead_id=${leadId}, contact_id=${contactId})`;
+    console.error(`❌ [${execution_id}] ${msg}`);
+    await supabase.from('unipile_sequence_executions')
+      .update({ status: 'failed', error_message: msg, updated_at: new Date().toISOString() })
+      .eq('id', execution_id);
+    return;
   }
-  console.log(`✅ Resolved entity: ${lead.first_name} ${lead.last_name} <${lead.email}> linkedin=${lead.linkedin}`);
+  console.log(`✅ [${execution_id}] Resolved entity: ${lead.first_name} ${lead.last_name} <${lead.email}> linkedin=${lead.linkedin}`);
   const sequence = (execution as any).unipile_sequences as any;
   const executionLog: any[] = Array.isArray(execution.execution_log) ? execution.execution_log as any[] : [];
 
@@ -236,9 +250,14 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   }
 
   // Claim execution for processing (prevents duplicate sends across concurrent workers)
-  const { data: claimed } = await supabase.rpc('claim_execution_for_processing', { p_execution_id: execution_id });
+  const { data: claimed, error: claimError } = await supabase.rpc('claim_execution_for_processing', { p_execution_id: execution_id });
+  console.log(`🔒 [${execution_id}] Claim result: claimed=${claimed}${claimError ? ` claimError=${claimError.message}` : ''}`);
   if (!claimed) {
-    console.log(`⏭️ Execution ${execution_id} already claimed by another worker, skipping`);
+    if (claimError) {
+      console.error(`❌ [${execution_id}] Claim RPC failed:`, claimError.message);
+    } else {
+      console.log(`⏭️ [${execution_id}] Already claimed by another worker, skipping`);
+    }
     return;
   }
 
@@ -283,6 +302,8 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
       }
     }
   }
+
+  console.log(`🏦 [${execution_id}] Accounts: linkedin=${assignedLinkedInAccountId || 'none'}, email=${assignedEmailAccountId || 'none'}`);
 
   // 5. First-step connection check
   const isFirstStep = executionLog.length === 0;
@@ -350,11 +371,19 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   const currentStep = steps.find((s: any) => s.id === currentStepId) || firstStep;
 
   if (!currentStep) {
-    console.error(`No current step found for execution ${execution_id}`);
+    const msg = `No step found (current_step_id=${currentStepId}, total_steps=${steps.length})`;
+    console.error(`❌ [${execution_id}] ${msg}`);
+    await supabase.from('unipile_sequence_executions')
+      .update({
+        error_message: msg,
+        next_execution_at: new Date(Date.now() + 300_000).toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', execution_id);
     return;
   }
 
-  console.log(`🔄 Execution ${execution_id}: step ${currentStep.step_type} (${currentStep.id})`);
+  console.log(`🔄 [${execution_id}] Step: ${currentStep.step_type} (${currentStep.id})`);
 
   // Auto-resolve missing LinkedIn account for LinkedIn steps
   if (!assignedLinkedInAccountId && LINKEDIN_STEP_TYPES.includes(currentStep.step_type)) {
@@ -371,6 +400,31 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
       await supabase.from('unipile_sequence_executions')
         .update({ assigned_linkedin_account_id: linkedInAccount.id })
         .eq('id', execution_id);
+      console.log(`🔧 [${execution_id}] Auto-resolved LinkedIn account: ${linkedInAccount.id}`);
+    } else {
+      console.warn(`⚠️ [${execution_id}] No active LinkedIn account found for client ${sequence?.client_id}`);
+    }
+  }
+
+  // Log the resolved account for send steps
+  if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
+    const sendAccountId = currentStep.step_type === 'email'
+      ? (assignedEmailAccountId || currentStep.configuration?.account_id)
+      : (assignedLinkedInAccountId || currentStep.configuration?.account_id);
+
+    if (sendAccountId) {
+      const { data: acctRow, error: acctErr } = await supabase
+        .from('unipile_accounts')
+        .select('id, account_id, status, provider')
+        .eq('id', sendAccountId)
+        .single();
+      if (acctErr) {
+        console.error(`❌ [${execution_id}] Account lookup failed for ${sendAccountId}:`, acctErr.message);
+      } else {
+        console.log(`🏦 [${execution_id}] Send account: internal=${sendAccountId} external=${acctRow?.account_id} status=${acctRow?.status} provider=${acctRow?.provider}`);
+      }
+    } else {
+      console.warn(`⚠️ [${execution_id}] No account ID for ${currentStep.step_type} step — will fail`);
     }
   }
 
@@ -1134,32 +1188,38 @@ export function startExecutionWorker() {
   const worker = new Worker<ExecutionJobData>(
     'outreach-executions',
     async (job: Job<ExecutionJobData>) => {
-      const { execution_id } = job.data;
-      console.log(`🚀 Processing execution ${execution_id}`);
+      const { execution_id, group_key, channel } = job.data;
+      console.log(`🚀 [queue=outreach-executions job=${job.id}] execution=${execution_id} group=${group_key} channel=${channel}`);
 
       try {
         await executeStep(execution_id, stepResultWriter);
       } catch (err: any) {
-        console.error(`Fatal error in executeStep for ${execution_id}:`, err);
+        console.error(`❌ [job=${job.id}] Fatal error in executeStep for ${execution_id}:`, err.message);
 
-        // 17. Outer catch: if still running, schedule retry with backoff
-        const { data: exec } = await supabase
+        // Outer catch: ensure next_execution_at is set to the future so the scanner
+        // does not loop. Uses retry_count (the actual column name in the schema).
+        const { data: exec, error: fetchErr } = await supabase
           .from('unipile_sequence_executions')
-          .select('status, attempt_count')
+          .select('status, retry_count')
           .eq('id', execution_id)
           .single();
 
+        if (fetchErr) {
+          console.error(`❌ [job=${job.id}] Could not re-fetch execution ${execution_id} for retry scheduling:`, fetchErr.message);
+        }
+
         if (exec?.status === 'running') {
-          const attemptCount = ((exec as any).attempt_count || 0) + 1;
-          const retryDelayMs = Math.pow(2, Math.min(attemptCount - 1, 3)) * 60_000 + Math.random() * 30_000;
+          const retryCount = ((exec as any).retry_count || 0) + 1;
+          const retryDelayMs = Math.pow(2, Math.min(retryCount - 1, 3)) * 60_000 + Math.random() * 30_000;
           await supabase.from('unipile_sequence_executions')
             .update({
               next_execution_at: new Date(Date.now() + retryDelayMs).toISOString(),
-              attempt_count: attemptCount,
+              retry_count: retryCount,
+              error_message: err.message,
               updated_at: new Date().toISOString(),
             })
             .eq('id', execution_id);
-          console.log(`🔄 Outer catch retry for ${execution_id} in ${Math.round(retryDelayMs / 1000)}s`);
+          console.log(`🔄 [job=${job.id}] Outer catch: retry ${execution_id} in ${Math.round(retryDelayMs / 1000)}s (retry_count=${retryCount})`);
         }
 
         throw err;
@@ -1175,14 +1235,18 @@ export function startExecutionWorker() {
     }
   );
 
+  worker.on('active', (job) => {
+    console.log(`▶️  [queue=outreach-executions] job=${job.id} active`);
+  });
+
   worker.on('failed', (job, err) => {
-    console.error(`❌ Job ${job?.id} failed (attempt ${job?.attemptsMade}):`, err.message);
+    console.error(`❌ [queue=outreach-executions] job=${job?.id} failed (attempt ${job?.attemptsMade}/${job?.opts?.attempts}):`, err.message);
   });
 
   worker.on('completed', (job) => {
-    console.log(`✅ Job ${job.id} completed`);
+    console.log(`✅ [queue=outreach-executions] job=${job.id} completed`);
   });
 
-  console.log(`✅ Execution worker started (concurrency: ${config.workerConcurrency}, rate: ${config.workerRateLimit}/min)`);
+  console.log(`✅ BullMQ processor listening on queue 'outreach-executions' (concurrency=${config.workerConcurrency}, rate=${config.workerRateLimit}/min)`);
   return worker;
 }
