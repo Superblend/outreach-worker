@@ -1175,7 +1175,18 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   console.log(`➡️ Execution ${execution_id} advanced to step ${nextStepId}`);
 
   } finally {
-    await supabase.rpc('release_execution_claim', { p_execution_id: execution_id, p_new_state: 'not_started' });
+    if (claimed) {
+      const { error: releaseErr } = await supabase.rpc('release_execution_claim', {
+        p_execution_id: execution_id,
+        p_new_state: 'not_started',
+      });
+      if (releaseErr) {
+        console.error(`❌ [${execution_id}] release_execution_claim failed: ${releaseErr.message} — forcing execution_state reset`);
+        await supabase.from('unipile_sequence_executions')
+          .update({ execution_state: 'not_started', updated_at: new Date().toISOString() })
+          .eq('id', execution_id);
+      }
+    }
   }
 }
 

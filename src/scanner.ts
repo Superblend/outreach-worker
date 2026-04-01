@@ -39,6 +39,7 @@ async function scanAndEnqueue() {
       unipile_sequence_steps!unipile_sequence_executions_current_step_id_fkey(step_type)
     `)
     .eq('status', 'running')
+    .eq('execution_state', 'not_started')
     .eq('unipile_sequences.status', 'active')
     .eq('unipile_sequences.use_bullmq', true)
     .lte('next_execution_at', nowIso)
