@@ -132,6 +132,7 @@ async function smartReschedule(
       p_account_id: accountId,
       p_message_type: messageType,
       p_max_default: defaultLimit,
+      p_dry_run: true,
     });
 
     if (limitCheck && !limitCheck.allowed) continue;
