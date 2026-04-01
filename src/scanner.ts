@@ -113,11 +113,15 @@ async function scanAndEnqueue() {
     // Group by account+channel and enqueue with appropriate delays
     const groups = new Map<string, Array<typeof validExecs[0]>>();
     
+    console.log(`Scanner: ${validExecs.length} executions passed time/day filters (of ${dueExecutions.length} found)`);
+
     for (const exec of validExecs) {
-      const stepData = exec.unipile_sequence_steps as any;
+      // Normalize: PostgREST may return steps as an object or a single-element array
+      const rawStepData = exec.unipile_sequence_steps as any;
+      const stepData = Array.isArray(rawStepData) ? rawStepData[0] : rawStepData;
       const stepType = stepData?.step_type || 'unknown';
       let key: string;
-      
+
       if (LINKEDIN_STEP_TYPES.includes(stepType)) {
         key = `linkedin:${exec.assigned_linkedin_account_id || 'unknown'}`;
       } else if (stepType === 'email') {
@@ -125,7 +129,9 @@ async function scanAndEnqueue() {
       } else {
         key = `other:${exec.id}`;
       }
-      
+
+      console.log(`Scanner: grouping exec=${exec.id} stepType=${stepType} key=${key}`);
+
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key)!.push(exec);
     }
@@ -133,11 +139,12 @@ async function scanAndEnqueue() {
     // Enqueue jobs with staggered delays per account group
     for (const [groupKey, execs] of groups) {
       const [channel] = groupKey.split(':');
-      
+      let enqueued = 0;
+
       for (let i = 0; i < execs.length; i++) {
         const exec = execs[i];
         let delay = 0;
-        
+
         if (channel === 'linkedin') {
           // Stagger within the group: i-th job delayed by i * (8-15s)
           delay = i * (config.linkedinInterSendDelayMs + Math.random() * config.linkedinJitterMs);
@@ -146,26 +153,34 @@ async function scanAndEnqueue() {
           const batchIndex = Math.floor(i / config.emailBatchSize);
           delay = batchIndex * (config.emailInterSendDelayMs + Math.random() * config.emailJitterMs);
         }
-        
-        await executionQueue.add(
-          'execute-step',
-          {
-            execution_id: exec.id,
-            group_key: groupKey,
-            channel,
-          },
-          {
-            delay: Math.round(delay),
-            attempts: 3,
-            backoff: { type: 'exponential', delay: 5000 },
-            jobId: `exec:${exec.id}:${exec.current_step_id}:${Date.now()}`,
-            removeOnComplete: { age: 3600, count: 1000 },
-            removeOnFail: { age: 86400, count: 5000 },
-          }
-        );
+
+        const jobId = `exec:${exec.id}:${exec.current_step_id}:${Date.now()}`;
+        console.log(`Scanner: enqueueing exec=${exec.id} jobId=${jobId} delay=${Math.round(delay)}ms`);
+
+        try {
+          await executionQueue.add(
+            'execute-step',
+            {
+              execution_id: exec.id,
+              group_key: groupKey,
+              channel,
+            },
+            {
+              delay: Math.round(delay),
+              attempts: 3,
+              backoff: { type: 'exponential', delay: 5000 },
+              jobId,
+              removeOnComplete: { age: 3600, count: 1000 },
+              removeOnFail: { age: 86400, count: 5000 },
+            }
+          );
+          enqueued++;
+        } catch (enqueueErr: any) {
+          console.error(`Scanner: ❌ Failed to enqueue exec=${exec.id}:`, enqueueErr.message);
+        }
       }
-      
-      console.log(`📦 Enqueued ${execs.length} jobs for ${groupKey}`);
+
+      console.log(`📦 Enqueued ${enqueued}/${execs.length} jobs for ${groupKey}`);
     }
   }
 
