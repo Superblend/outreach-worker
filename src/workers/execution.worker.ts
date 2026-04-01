@@ -65,7 +65,8 @@ function isNonRetryableError(message: string): boolean {
     lower.includes('profile not found') ||
     lower.includes('unauthorized') ||
     lower.includes('invalid') ||
-    lower.includes('missing required')
+    lower.includes('missing required') ||
+    lower.includes('follow_up_threading_rejected')
   );
 }
 
@@ -624,14 +625,17 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
             .select('response_data')
             .eq('execution_id', execution_id)
             .eq('status', 'success')
-            .order('created_at', { ascending: true })
+            .eq('step_type', 'email')
+            .not('response_data->provider_id', 'is', null)
+            .order('executed_at', { ascending: true })
             .limit(1) as any).maybeSingle();
 
           if (firstEmailResult?.response_data) {
             inReplyToMessageId = firstEmailResult.response_data.provider_id;
             originalSubject = firstEmailResult.response_data.subject;
           }
-          // If no previous email, auto-correct to new (don't set reply fields)
+          // If no previous email found, send as new (not a reply)
+          console.log(`📧 [${execution_id}] step=${currentStep.id} is_follow_up=true previous_found=${!!firstEmailResult} in_reply_to=${inReplyToMessageId || 'none'} original_subject="${originalSubject || 'none'}" final_subject="${cfg.subject || ''}"`);
         }
 
         const result = await sendEmail({
@@ -649,6 +653,10 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
           nextStepId = await getNextStepId(currentStep.id);
         } else {
           stepError = result.error || 'Unknown error';
+          // 422 on a follow-up means threading data was rejected — pause so data can be corrected
+          if (cfg.is_follow_up && (stepError.includes('422') || stepError.includes('Unprocessable'))) {
+            stepError = `follow_up_threading_rejected: ${stepError}`;
+          }
         }
         break;
       }
@@ -1058,8 +1066,24 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     const isLastStep = !(await getNextStepId(currentStep.id));
     const isGating = GATING_STEP_TYPES.includes(currentStep.step_type);
 
+    const isFollowUpRejection = errMsg.includes('follow_up_threading_rejected');
+
     if (nonRetryable || !retryable || attemptsMade >= maxRetries) {
-      if (isGating && attemptsMade >= maxRetries) {
+      if (isFollowUpRejection) {
+        await supabase.from('unipile_sequence_executions')
+          .update({
+            status: 'paused',
+            error_message: errMsg,
+            execution_log: [...executionLog, {
+              step_id: currentStep.id, step_type: currentStep.step_type,
+              action: 'follow_up_rejected_paused', error: errMsg,
+              executed_at: new Date().toISOString(),
+            }],
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', execution_id);
+        console.log(`⏸️ [${execution_id}] Follow-up email rejected (422), pausing for manual review`);
+      } else if (isGating && attemptsMade >= maxRetries) {
         await supabase.from('unipile_sequence_executions')
           .update({
             status: 'paused',
