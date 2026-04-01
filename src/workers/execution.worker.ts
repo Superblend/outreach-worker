@@ -179,7 +179,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     .select(`
       *, sequence_version,
       unipile_sequences(*, scheduled_start_time, scheduled_end_time, timezone, active_days, client_id, status),
-      leads(*), contacts(*), unipile_sequence_steps(*)
+      unipile_sequence_steps(*)
     `)
     .eq('id', execution_id)
     .single();
@@ -188,7 +188,29 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     throw new Error(`Failed to fetch execution ${execution_id}: ${execError?.message}`);
   }
 
-  const lead = execution.contact_id ? (execution as any).contacts : (execution as any).leads;
+  // Resolve entity (lead or contact) by explicit query
+  let lead: any;
+  if ((execution as any).lead_id) {
+    const { data: leadData } = await supabase
+      .from('leads')
+      .select('first_name, last_name, email, linkedin, company, position')
+      .eq('id', (execution as any).lead_id)
+      .single();
+    lead = leadData;
+  } else if ((execution as any).contact_id) {
+    const { data: contactData } = await supabase
+      .from('contacts')
+      .select('first_name, last_name, email, linkedin, company, position')
+      .eq('id', (execution as any).contact_id)
+      .single();
+    lead = contactData;
+  } else {
+    throw new Error(`Execution ${execution_id} has neither lead_id nor contact_id`);
+  }
+
+  if (!lead) {
+    throw new Error(`Execution ${execution_id}: entity not found (lead_id=${(execution as any).lead_id}, contact_id=${(execution as any).contact_id})`);
+  }
   const sequence = (execution as any).unipile_sequences as any;
   const executionLog: any[] = Array.isArray(execution.execution_log) ? execution.execution_log as any[] : [];
 
