@@ -189,28 +189,35 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   }
 
   // Resolve entity (lead or contact) by explicit query
+  const leadId = (execution as any).lead_id;
+  const contactId = (execution as any).contact_id;
+  console.log(`🔍 Resolving entity: lead_id=${leadId}, contact_id=${contactId}`);
+
   let lead: any;
-  if ((execution as any).lead_id) {
-    const { data: leadData } = await supabase
+  if (leadId) {
+    const { data: leadData, error: leadErr } = await supabase
       .from('leads')
       .select('first_name, last_name, email, linkedin, company, position')
-      .eq('id', (execution as any).lead_id)
+      .eq('id', leadId)
       .single();
+    if (leadErr) console.error(`❌ Failed to fetch lead ${leadId}:`, leadErr.message);
     lead = leadData;
-  } else if ((execution as any).contact_id) {
-    const { data: contactData } = await supabase
+  } else if (contactId) {
+    const { data: contactData, error: contactErr } = await supabase
       .from('contacts')
       .select('first_name, last_name, email, linkedin, company, position')
-      .eq('id', (execution as any).contact_id)
+      .eq('id', contactId)
       .single();
+    if (contactErr) console.error(`❌ Failed to fetch contact ${contactId}:`, contactErr.message);
     lead = contactData;
   } else {
     throw new Error(`Execution ${execution_id} has neither lead_id nor contact_id`);
   }
 
   if (!lead) {
-    throw new Error(`Execution ${execution_id}: entity not found (lead_id=${(execution as any).lead_id}, contact_id=${(execution as any).contact_id})`);
+    throw new Error(`Execution ${execution_id}: entity not found (lead_id=${leadId}, contact_id=${contactId})`);
   }
+  console.log(`✅ Resolved entity: ${lead.first_name} ${lead.last_name} <${lead.email}> linkedin=${lead.linkedin}`);
   const sequence = (execution as any).unipile_sequences as any;
   const executionLog: any[] = Array.isArray(execution.execution_log) ? execution.execution_log as any[] : [];
 
@@ -438,6 +445,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
         p_message_type: messageType,
         p_max_default: currentStep.configuration?.daily_limit || defaultLimit,
       });
+      console.log(`📊 Daily limit check result for ${execution_id} (${messageType}): ${JSON.stringify(limitResult)}`);
 
       if (limitResult && !limitResult.allowed) {
         const nextTime = await smartReschedule(execution, accountId, messageType, defaultLimit);
