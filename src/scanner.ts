@@ -154,7 +154,7 @@ async function scanAndEnqueue() {
           delay = batchIndex * (config.emailInterSendDelayMs + Math.random() * config.emailJitterMs);
         }
 
-        const jobId = `exec:${exec.id}:${exec.current_step_id}:${Date.now()}`;
+        const jobId = `exec-${exec.id}-${exec.current_step_id}-${Date.now()}`;
         console.log(`Scanner: enqueueing exec=${exec.id} jobId=${jobId} delay=${Math.round(delay)}ms`);
 
         try {
