@@ -50,10 +50,37 @@ return 0
 `;
 
 async function acquireLinkedInSlot(accountId: string): Promise<number> {
-  const key = `linkedin-pacing:${accountId}`;
+  const key = `linkedin:${accountId}`;
   const now = Date.now();
   const gap = Math.round(LINKEDIN_PACING_MIN_MS + Math.random() * (LINKEDIN_PACING_MAX_MS - LINKEDIN_PACING_MIN_MS));
   const waitMs = await connection.eval(PACING_LUA, 1, key, String(now), String(gap), String(LINKEDIN_PACING_TTL_S)) as number;
+  return waitMs;
+}
+
+const EMAIL_PACING_MIN_MS = 10_000;
+const EMAIL_PACING_MAX_MS = 20_000;
+const EMAIL_PACING_TTL_S = 120;
+
+const EMAIL_PACING_LUA = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local gap = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+local last = tonumber(redis.call('GET', key) or '0')
+local elapsed = now - last
+if elapsed >= gap then
+  redis.call('SET', key, tostring(now), 'EX', ttl)
+  return 0
+else
+  return gap - elapsed
+end
+`;
+
+async function acquireEmailSlot(accountId: string): Promise<number> {
+  const key = `email:${accountId}`;
+  const now = Date.now();
+  const gap = Math.round(EMAIL_PACING_MIN_MS + Math.random() * (EMAIL_PACING_MAX_MS - EMAIL_PACING_MIN_MS));
+  const waitMs = await connection.eval(EMAIL_PACING_LUA, 1, key, String(now), String(gap), String(EMAIL_PACING_TTL_S)) as number;
   return waitMs;
 }
 
@@ -227,7 +254,7 @@ async function checkAndRerouteFromConditional(
   return yesEdge?.target_step_id || null;
 }
 
-async function executeStep(execution_id: string, stepResultWriter: BatchWriter) {
+async function executeStep(execution_id: string, stepResultWriter: BatchWriter, job: Job<ExecutionJobData>) {
   // 1. Fetch execution data
   const { data: execution, error: execError } = await supabase
     .from('unipile_sequence_executions')
@@ -596,6 +623,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   let stepResult: any = null;
   let stepError: string | null = null;
   let nextStepId: string | null = null;
+  let executedAt: string | null = null; // captured right after API responds
 
   try {
     switch (currentStep.step_type) {
@@ -612,6 +640,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
 
         // Always capture result so webhook fields are persisted even on failure
         stepResult = result;
+        if (result.success) executedAt = new Date().toISOString();
 
         if (result.success) {
           nextStepId = await getNextStepId(currentStep.id);
@@ -627,10 +656,15 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
                 .update({ status: 'completed', updated_at: new Date().toISOString() })
                 .eq('id', execution_id);
               if (preIncrementedAccountId) {
-                await supabase.rpc('rollback_daily_limit_increment', {
-                  p_account_id: preIncrementedAccountId,
-                  p_message_type: preIncrementedMessageType,
-                });
+                try {
+                  await supabase.rpc('rollback_daily_limit_increment', {
+                    p_account_id: preIncrementedAccountId,
+                    p_action_type: preIncrementedMessageType,
+                    p_date: new Date().toISOString().split('T')[0],
+                  });
+                } catch (e: any) {
+                  console.warn(`⚠️ Failed to rollback daily limit for ${preIncrementedAccountId}:`, e.message);
+                }
               }
               return;
             }
@@ -654,6 +688,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
 
         if (result.success) {
           stepResult = result;
+          executedAt = new Date().toISOString();
           nextStepId = await getNextStepId(currentStep.id);
         } else {
           stepError = result.error || 'Unknown error';
@@ -692,9 +727,6 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
           console.log(`📧 [${execution_id}] step=${currentStep.id} is_follow_up=true previous_found=${!!firstEmailResult} in_reply_to=${inReplyToMessageId || 'none'} original_subject="${originalSubject || 'none'}" final_subject="${cfg.subject || ''}"`);
         }
 
-        // Email pacing: 10-20s random delay for human-behaviour protection
-        await new Promise(r => globalThis.setTimeout(r, 10_000 + Math.random() * 10_000));
-
         const result = await sendEmail({
           account_id: accountId,
           lead,
@@ -707,6 +739,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
 
         if (result.success) {
           stepResult = result;
+          executedAt = new Date().toISOString();
           nextStepId = await getNextStepId(currentStep.id);
         } else {
           stepError = result.error || 'Unknown error';
@@ -1019,10 +1052,15 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     console.log(`🔌 Connection status error for ${execution_id} (${completedReason}): ${stepError}`);
 
     if (preIncrementedAccountId) {
-      await supabase.rpc('rollback_daily_limit_increment', {
-        p_account_id: preIncrementedAccountId,
-        p_message_type: preIncrementedMessageType,
-      });
+      try {
+        await supabase.rpc('rollback_daily_limit_increment', {
+          p_account_id: preIncrementedAccountId,
+          p_action_type: preIncrementedMessageType,
+          p_date: new Date().toISOString().split('T')[0],
+        });
+      } catch (e: any) {
+        console.warn(`⚠️ Failed to rollback daily limit for ${preIncrementedAccountId}:`, e.message);
+      }
     }
 
     await stepResultWriter.add({
@@ -1071,6 +1109,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
     error_message: stepError || null,
     unipile_message_id: stepResult?.provider_id || stepResult?.message_id || null,
     unipile_chat_id: stepResult?.chat_id || null,
+    executed_at: executedAt || new Date().toISOString(),
   };
 
   if (currentStep.step_type === 'email' && stepResult) {
@@ -1128,10 +1167,15 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
 
   // 13. Rollback daily limit on failure
   if (!stepSuccess && preIncrementedAccountId) {
-    await supabase.rpc('rollback_daily_limit_increment', {
-      p_account_id: preIncrementedAccountId,
-      p_message_type: preIncrementedMessageType,
-    });
+    try {
+      await supabase.rpc('rollback_daily_limit_increment', {
+        p_account_id: preIncrementedAccountId,
+        p_action_type: preIncrementedMessageType,
+        p_date: new Date().toISOString().split('T')[0],
+      });
+    } catch (e: any) {
+      console.warn(`⚠️ Failed to rollback daily limit for ${preIncrementedAccountId}:`, e.message);
+    }
   }
 
   // 14. Insert message_sent event for email steps (powers inbox/unibox display)
@@ -1351,28 +1395,47 @@ export function startExecutionWorker() {
         if (accountId && accountId !== 'unknown') {
           const waitMs = await acquireLinkedInSlot(accountId);
           if (waitMs > 0) {
+            const newJobId = `exec-${execution_id}-${Date.now()}`;
             const requeueDelay = Math.round(waitMs) + Math.round(Math.random() * 5_000);
-            await executionQueue.add(
-              'execute-step',
-              job.data,
-              {
-                delay: requeueDelay,
-                attempts: 3,
-                backoff: { type: 'exponential', delay: 5000 },
-                jobId: `exec-${execution_id}-${Date.now()}`,
-                removeOnComplete: { age: 3600, count: 1000 },
-                removeOnFail: { age: 86400, count: 5000 },
-              }
-            );
-            console.log(`⏳ [linkedin-pacing] exec=${execution_id} account=${accountId} requeued in ${Math.round(waitMs / 1000)}s`);
+            await executionQueue.add('execute-step', job.data, {
+              delay: requeueDelay,
+              attempts: 3,
+              backoff: { type: 'exponential', delay: 5000 },
+              jobId: newJobId,
+              removeOnComplete: { age: 3600, count: 1000 },
+              removeOnFail: { age: 86400, count: 5000 },
+            });
+            console.log(`⏳ [linkedin-pacing] exec=${execution_id} account=${accountId} requeued in ${Math.round(waitMs / 1000)}s newJobId=${newJobId}`);
             return;
           }
-          console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${accountId} slot acquired`);
+          console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${accountId} slot acquired waitMs=0`);
+        }
+      }
+
+      // Per-account email pacing: enforce 10-20s gap between consecutive sends
+      if (channel === 'email') {
+        const accountId = group_key.split(':')[1];
+        if (accountId && accountId !== 'unknown') {
+          const waitMs = await acquireEmailSlot(accountId);
+          if (waitMs > 0) {
+            const newJobId = `exec-${execution_id}-${Date.now()}`;
+            await executionQueue.add('execute-step', job.data, {
+              delay: Math.round(waitMs),
+              attempts: 3,
+              backoff: { type: 'exponential', delay: 5000 },
+              jobId: newJobId,
+              removeOnComplete: { age: 3600, count: 1000 },
+              removeOnFail: { age: 86400, count: 5000 },
+            });
+            console.log(`⏳ [email-pacing] exec=${execution_id} account=${accountId} requeued in ${Math.round(waitMs / 1000)}s newJobId=${newJobId}`);
+            return;
+          }
+          console.log(`✅ [email-pacing] exec=${execution_id} account=${accountId} slot acquired waitMs=0`);
         }
       }
 
       try {
-        await executeStep(execution_id, stepResultWriter);
+        await executeStep(execution_id, stepResultWriter, job);
       } catch (err: any) {
         console.error(`❌ [job=${job.id}] Fatal error in executeStep for ${execution_id}:`, err.message);
 
