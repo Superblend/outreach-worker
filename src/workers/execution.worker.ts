@@ -102,6 +102,28 @@ function isNonRetryableError(message: string): boolean {
   );
 }
 
+const CONNECTION_STATUS_ERROR_PATTERNS = [
+  'not connected', 'not first degree', 'cannot create chat', 'chat create failed',
+  'already connected', 'connection exists', 'pending invitation', 'already_invited',
+  'already_invited_recently', 'recipient cannot be reached', 'profile not found',
+  'cannot message', 'cannot invite',
+];
+
+const LINKEDIN_CONNECTION_STEP_TYPES = ['linkedin_invitation', 'linkedin_message', 'linkedin_engage_post'];
+
+function isConnectionStatusError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return CONNECTION_STATUS_ERROR_PATTERNS.some(pattern => lower.includes(pattern));
+}
+
+function getConnectionStatusReason(message: string): string {
+  const lower = message.toLowerCase();
+  if (lower.includes('already connected') || lower.includes('connection exists')) return 'already_connected';
+  if (lower.includes('pending invitation') || lower.includes('already_invited') || lower.includes('already_invited_recently')) return 'invitation_pending';
+  if (lower.includes('profile not found')) return 'profile_not_found';
+  return 'not_connected';
+}
+
 async function getNextStepId(currentStepId: string, handle?: string): Promise<string | null> {
   const query = supabase
     .from('unipile_sequence_edges')
@@ -670,6 +692,9 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
           console.log(`📧 [${execution_id}] step=${currentStep.id} is_follow_up=true previous_found=${!!firstEmailResult} in_reply_to=${inReplyToMessageId || 'none'} original_subject="${originalSubject || 'none'}" final_subject="${cfg.subject || ''}"`);
         }
 
+        // Email pacing: 10-20s random delay for human-behaviour protection
+        await new Promise(r => globalThis.setTimeout(r, 10_000 + Math.random() * 10_000));
+
         const result = await sendEmail({
           account_id: accountId,
           lead,
@@ -986,6 +1011,52 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   } catch (err: any) {
     stepError = err.message || 'Unexpected error during step execution';
     console.error(`❌ Step execution error for ${execution_id}:`, err);
+  }
+
+  // 11b. Connection-status error short-circuit for LinkedIn steps
+  if (stepError && LINKEDIN_CONNECTION_STEP_TYPES.includes(currentStep.step_type) && isConnectionStatusError(stepError)) {
+    const completedReason = getConnectionStatusReason(stepError);
+    console.log(`🔌 Connection status error for ${execution_id} (${completedReason}): ${stepError}`);
+
+    if (preIncrementedAccountId) {
+      await supabase.rpc('rollback_daily_limit_increment', {
+        p_account_id: preIncrementedAccountId,
+        p_message_type: preIncrementedMessageType,
+      });
+    }
+
+    await stepResultWriter.add({
+      execution_id,
+      step_id: currentStep.id,
+      lead_id: (execution as any).lead_id,
+      contact_id: (execution as any).contact_id,
+      step_type: currentStep.step_type,
+      status: 'completed',
+      response_data: { completed_reason: completedReason, connection_status_error: true, original_error: stepError },
+      error_message: null,
+      unipile_message_id: null,
+      unipile_chat_id: null,
+    });
+    await stepResultWriter.flush();
+
+    await supabase.from('unipile_sequence_executions')
+      .update({
+        status: 'completed',
+        completed_at: new Date().toISOString(),
+        execution_log: [...executionLog, {
+          step_id: currentStep.id,
+          step_type: currentStep.step_type,
+          action: 'completed_connection_status',
+          status: 'completed',
+          reason: completedReason,
+          executed_at: new Date().toISOString(),
+        }],
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', execution_id);
+
+    console.log(`✅ Execution ${execution_id} completed (connection status: ${completedReason})`);
+    return;
   }
 
   // 12. Record step result
