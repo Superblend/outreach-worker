@@ -699,7 +699,15 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
           if (nextStep?.step_type === 'delay') {
             const nv = nextStep.configuration?.delay_value || nextStep.delay_value || 1;
             const nu = nextStep.configuration?.delay_unit || nextStep.delay_unit || 'days';
-            nextExecAt = new Date(Date.now() + calculateDelay(nv, nu));
+            const rawDate = new Date(Date.now() + calculateDelay(nv, nu));
+            if (nu === 'days' && sequence?.scheduled_start_time) {
+              const tz = sequence.timezone || 'UTC';
+              const [sH, sM] = sequence.scheduled_start_time.split(':').map(Number);
+              const targetDayStr = rawDate.toLocaleDateString('en-CA', { timeZone: tz }); // YYYY-MM-DD
+              nextExecAt = convertToUTC(targetDayStr, sH, sM, tz);
+            } else {
+              nextExecAt = rawDate;
+            }
           }
           nextExecAt = await enforceTimeWindow(nextExecAt, sequence);
 
@@ -1178,7 +1186,15 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter) 
   if (nextStep?.step_type === 'delay') {
     const dv = nextStep.configuration?.delay_value || nextStep.delay_value || 1;
     const du = nextStep.configuration?.delay_unit || nextStep.delay_unit || 'days';
-    nextExecAt = new Date(Date.now() + calculateDelay(dv, du));
+    const rawDate = new Date(Date.now() + calculateDelay(dv, du));
+    if (du === 'days' && sequence?.scheduled_start_time) {
+      const tz = sequence.timezone || 'UTC';
+      const [sH, sM] = sequence.scheduled_start_time.split(':').map(Number);
+      const targetDayStr = rawDate.toLocaleDateString('en-CA', { timeZone: tz }); // YYYY-MM-DD
+      nextExecAt = convertToUTC(targetDayStr, sH, sM, tz);
+    } else {
+      nextExecAt = rawDate;
+    }
   }
 
   nextExecAt = await enforceTimeWindow(nextExecAt, sequence);
