@@ -1,5 +1,5 @@
 import { Worker, Job } from 'bullmq';
-import { connection } from '../queues/definitions';
+import { connection, executionQueue } from '../queues/definitions';
 import { supabase, invokeEdgeFunction } from '../supabase';
 import { config } from '../config';
 import { sendEmail } from '../lib/unipile-send-email';
@@ -24,6 +24,38 @@ const LINKEDIN_STEP_TYPES = [
 
 const SENDING_STEP_TYPES = ['linkedin_invitation', 'linkedin_message', 'email'];
 const GATING_STEP_TYPES = ['linkedin_invitation'];
+
+const LINKEDIN_PACING_MIN_MS = 45_000;
+const LINKEDIN_PACING_MAX_MS = 90_000;
+const LINKEDIN_PACING_TTL_S = 300; // safety TTL: 5 min
+
+// Atomically checks and acquires the per-account LinkedIn pacing slot.
+// Returns 0 if the slot is acquired (caller may proceed), or the number of ms
+// to wait if the slot is still locked by a recent send.
+// Uses a Lua script so the read-compare-set is atomic against Redis.
+const PACING_LUA = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local minGap = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+local lastSend = redis.call('GET', key)
+if lastSend then
+  local elapsed = now - tonumber(lastSend)
+  if elapsed < minGap then
+    return minGap - elapsed
+  end
+end
+redis.call('SET', key, tostring(now), 'EX', ttl)
+return 0
+`;
+
+async function acquireLinkedInSlot(accountId: string): Promise<number> {
+  const key = `linkedin-pacing:${accountId}`;
+  const now = Date.now();
+  const gap = Math.round(LINKEDIN_PACING_MIN_MS + Math.random() * (LINKEDIN_PACING_MAX_MS - LINKEDIN_PACING_MIN_MS));
+  const waitMs = await connection.eval(PACING_LUA, 1, key, String(now), String(gap), String(LINKEDIN_PACING_TTL_S)) as number;
+  return waitMs;
+}
 
 function calculateDelay(value: number, unit: string): number {
   switch (unit) {
@@ -1241,6 +1273,32 @@ export function startExecutionWorker() {
     async (job: Job<ExecutionJobData>) => {
       const { execution_id, group_key, channel } = job.data;
       console.log(`🚀 [queue=outreach-executions job=${job.id}] execution=${execution_id} group=${group_key} channel=${channel}`);
+
+      // Per-account LinkedIn pacing: enforce 45-90s gap between consecutive actions
+      if (channel === 'linkedin') {
+        const accountId = group_key.split(':')[1];
+        if (accountId && accountId !== 'unknown') {
+          const waitMs = await acquireLinkedInSlot(accountId);
+          if (waitMs > 0) {
+            const requeueDelay = Math.round(waitMs) + Math.round(Math.random() * 5_000);
+            await executionQueue.add(
+              'execute-step',
+              job.data,
+              {
+                delay: requeueDelay,
+                attempts: 3,
+                backoff: { type: 'exponential', delay: 5000 },
+                jobId: `exec-${execution_id}-${Date.now()}`,
+                removeOnComplete: { age: 3600, count: 1000 },
+                removeOnFail: { age: 86400, count: 5000 },
+              }
+            );
+            console.log(`⏳ [linkedin-pacing] exec=${execution_id} account=${accountId} requeued in ${Math.round(waitMs / 1000)}s`);
+            return;
+          }
+          console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${accountId} slot acquired`);
+        }
+      }
 
       try {
         await executeStep(execution_id, stepResultWriter);
