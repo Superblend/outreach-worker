@@ -2,6 +2,7 @@ import { Worker, Job } from 'bullmq';
 import { connection, executionQueue } from '../queues/definitions';
 import { workerHealth } from '../health';
 import { supabase, invokeEdgeFunction } from '../supabase';
+import { localMinutesOfDay, localDateString, localWeekday } from '../lib/time-utils';
 import { config } from '../config';
 import { sendEmail } from '../lib/unipile-send-email';
 import { sendLinkedInInvitation } from '../lib/unipile-send-linkedin-invitation';
@@ -175,19 +176,19 @@ async function enforceTimeWindow(proposedTime: Date, sequence: any): Promise<Dat
   const [startH, startM] = sequence.scheduled_start_time.split(':').map(Number);
   const [endH, endM] = sequence.scheduled_end_time.split(':').map(Number);
 
-  const localTimeStr = proposedTime.toLocaleString('en-US', {
-    timeZone: timezone, hour: 'numeric', minute: 'numeric', hour12: false,
-  });
-  const [lh, lm] = localTimeStr.split(':').map((s: string) => parseInt(s, 10));
-  const curMin = lh * 60 + lm;
+  // Use formatToParts-based helper — avoids the "2 AM" / NaN bug from
+  // toLocaleString('en-US', { hour: 'numeric', hour12: false }) on some Node images
+  const curMin = localMinutesOfDay(proposedTime, timezone);
   const startMin = startH * 60 + startM;
   const endMin = endH * 60 + endM;
 
   if (curMin >= startMin && curMin <= endMin) return proposedTime;
 
-  const nextRunDate = new Date(proposedTime);
-  if (curMin > endMin) nextRunDate.setDate(nextRunDate.getDate() + 1);
-  const dateStr = nextRunDate.toLocaleDateString('en-CA', { timeZone: timezone });
+  // Use local date (not UTC date) so a timezone offset doesn't push us to the wrong calendar day
+  const targetDate = curMin > endMin
+    ? new Date(proposedTime.getTime() + 86_400_000)  // past end → next local day
+    : proposedTime;                                    // before start → same local day
+  const dateStr = localDateString(targetDate, timezone);
   return convertToUTC(dateStr, startH, startM, timezone);
 }
 
@@ -202,14 +203,12 @@ async function smartReschedule(
   const activeDays = sequence?.active_days || [0, 1, 2, 3, 4, 5, 6];
   const [startH, startM] = (sequence?.scheduled_start_time || '09:00').split(':').map(Number);
   const [endH, endM] = (sequence?.scheduled_end_time || '17:00').split(':').map(Number);
-  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
   const now = new Date();
   for (let dayOffset = 0; dayOffset <= 14; dayOffset++) {
     const candidate = new Date(now.getTime() + dayOffset * 86_400_000);
-    const localDayStr = candidate.toLocaleString('en-US', { timeZone: timezone, weekday: 'short' });
-    const localDay = dayNames.indexOf(localDayStr.substring(0, 3));
-    if (localDay === -1 || !activeDays.includes(localDay)) continue;
+    const localDay = localWeekday(candidate, timezone);
+    if (!activeDays.includes(localDay)) continue;
 
     const { data: limitCheck } = await supabase.rpc('check_and_increment_daily_limit', {
       p_account_id: accountId,
@@ -345,6 +344,27 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   }
 
   try {
+
+  // Defense-in-depth: re-check the time window here, even if the scanner already filtered.
+  // A job can be enqueued during the window but processed after it closes (pacing requeue,
+  // queue backlog, worker restart delay). Releasing the claim and rescheduling is safe
+  // because the finally block will reset execution_state back to not_started.
+  if (sequence?.scheduled_start_time && sequence?.scheduled_end_time) {
+    const tz = sequence.timezone || 'UTC';
+    const curMin = localMinutesOfDay(new Date(), tz);
+    const [startH, startM] = sequence.scheduled_start_time.split(':').map(Number);
+    const [endH, endM] = sequence.scheduled_end_time.split(':').map(Number);
+    const startMin = startH * 60 + startM;
+    const endMin = endH * 60 + endM;
+    if (curMin < startMin || curMin > endMin) {
+      const nextAt = await enforceTimeWindow(new Date(), sequence);
+      await supabase.from('unipile_sequence_executions')
+        .update({ next_execution_at: nextAt.toISOString(), updated_at: new Date().toISOString() })
+        .eq('id', execution_id);
+      console.log(`⏸️ [${execution_id}] Outside time window (localMin=${curMin}, window=${startMin}-${endMin}, tz=${tz}), rescheduled to ${nextAt.toISOString()}`);
+      return; // finally releases the claim
+    }
+  }
 
   // 3. Load all steps
   const { data: allSteps } = await supabase

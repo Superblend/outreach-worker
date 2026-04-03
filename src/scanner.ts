@@ -4,6 +4,7 @@ import { connection, executionQueue, batchQueue, scannerQueue, recoveryQueue } f
 import { supabase } from './supabase';
 import { config } from './config';
 import { workerHealth } from './health';
+import { localMinutesOfDay, localDateString, localWeekday } from './lib/time-utils';
 
 // One random 4-byte hex per process lifetime.
 // Stable within a session (prevents queue pile-up), unique across restarts
@@ -72,46 +73,48 @@ async function scanAndEnqueue() {
       const timezone = seq?.timezone || 'UTC';
       const activeDays = seq?.active_days || [0,1,2,3,4,5,6];
       
-      const localDayStr = now.toLocaleString('en-US', { timeZone: timezone, weekday: 'short' });
-      const dayMap: Record<string, number> = { 'Sun': 0, 'Mon': 1, 'Tue': 2, 'Wed': 3, 'Thu': 4, 'Fri': 5, 'Sat': 6 };
-      const currentDayOfWeek = dayMap[localDayStr] ?? now.getUTCDay();
-      
+      // localWeekday uses formatToParts — immune to en-US locale hour12 quirks
+      const currentDayOfWeek = localWeekday(now, timezone);
+
       if (!activeDays.includes(currentDayOfWeek)) {
-        // Reschedule to next active day
+        // Reschedule to the start of the next active day (in local timezone)
         const [startHour, startMinute] = (seq?.scheduled_start_time || '09:00').split(':').map(Number);
         let daysUntilNext = 1;
         for (let i = 1; i <= 7; i++) {
           if (activeDays.includes((currentDayOfWeek + i) % 7)) { daysUntilNext = i; break; }
         }
-        const nextDate = new Date(now);
-        nextDate.setDate(nextDate.getDate() + daysUntilNext);
-        const nextRunUTC = convertToUTC(nextDate.toISOString().split('T')[0], startHour, startMinute, timezone);
-        
+        const nextDate = new Date(now.getTime() + daysUntilNext * 86_400_000);
+        // Use local date (not UTC date) so the timezone offset doesn't shift us to the wrong day
+        const nextRunUTC = convertToUTC(localDateString(nextDate, timezone), startHour, startMinute, timezone);
+
         await supabase.from('unipile_sequence_executions')
           .update({ next_execution_at: nextRunUTC.toISOString(), updated_at: new Date().toISOString() })
           .eq('id', exec.id);
-        console.log(`⏸️ ${exec.id} on inactive day → ${nextRunUTC.toISOString()}`);
+        console.log(`⏸️ ${exec.id} inactive day (local weekday=${currentDayOfWeek}) → ${nextRunUTC.toISOString()}`);
         continue;
       }
-      
-      // Check time window
+
+      // Check time window using formatToParts — avoids the "2 AM" / NaN bug from
+      // toLocaleString('en-US', { hour: 'numeric', hour12: false }) on some Node images
       if (seq?.scheduled_start_time && seq?.scheduled_end_time) {
         const [startH, startM] = seq.scheduled_start_time.split(':').map(Number);
         const [endH, endM] = seq.scheduled_end_time.split(':').map(Number);
-        const localTimeStr = now.toLocaleString('en-US', { timeZone: timezone, hour: 'numeric', minute: 'numeric', hour12: false });
-        const [lh, lm] = localTimeStr.split(':').map((s: string) => parseInt(s, 10));
-        const curMin = lh * 60 + lm;
+        const curMin = localMinutesOfDay(now, timezone);
         const startMin = startH * 60 + startM;
         const endMin = endH * 60 + endM;
-        
+
+        console.log(`Scanner: [${exec.id}] timezone=${timezone} localMin=${curMin} window=${startMin}-${endMin}`);
+
         if (curMin < startMin || curMin > endMin) {
-          const nextRunDate = new Date(now);
-          if (curMin > endMin) nextRunDate.setDate(nextRunDate.getDate() + 1);
-          const nextRunUTC = convertToUTC(nextRunDate.toISOString().split('T')[0], startH, startM, timezone);
+          // Use local date (not UTC) when computing the next window start
+          const targetDate = curMin > endMin
+            ? new Date(now.getTime() + 86_400_000)  // past end → tomorrow local
+            : now;                                    // before start → today local
+          const nextRunUTC = convertToUTC(localDateString(targetDate, timezone), startH, startM, timezone);
           await supabase.from('unipile_sequence_executions')
             .update({ next_execution_at: nextRunUTC.toISOString(), updated_at: new Date().toISOString() })
             .eq('id', exec.id);
-          console.log(`⏸️ ${exec.id} outside time window → ${nextRunUTC.toISOString()}`);
+          console.log(`⏸️ ${exec.id} outside window (localMin=${curMin}, window=${startMin}-${endMin}) → ${nextRunUTC.toISOString()}`);
           continue;
         }
       }
