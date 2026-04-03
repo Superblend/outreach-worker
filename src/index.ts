@@ -1,26 +1,54 @@
 import express from 'express';
 import { config } from './config';
-import { startScanner } from './scanner';
+import { startScanner, triggerImmediateScan, SESSION_ID } from './scanner';
 import { startExecutionWorker } from './workers/execution.worker';
 import { startBatchWorker } from './workers/batch.worker';
 import { setupBullBoard } from './monitoring/bull-board';
 import { connection, executionQueue } from './queues/definitions';
 import { workerHealth } from './health';
+import { supabase } from './supabase';
 
-const WORKER_STALE_MS = 5 * 60_000; // 5 minutes
-const SCANNER_STALE_MS = 60_000;    // 60 seconds
+// Watchdog fires every 15s; triggers restart after 60s with no completed job + pending work.
+const WORKER_STALE_MS = 60_000;
+const WATCHDOG_WARMUP_MS = 90_000; // wait for process to fully boot before first stale check
+const SCANNER_STALE_MS = 60_000;
 let watchdogRunning = false;
+
+async function drainExecutionQueue(): Promise<void> {
+  try {
+    await executionQueue.drain();
+    console.log('🧹 Execution queue drained (waiting + delayed jobs cleared)');
+  } catch (err: any) {
+    console.error('❌ Failed to drain execution queue:', err.message);
+  }
+}
+
+async function resetInProgressOrphans(): Promise<void> {
+  // On fresh process start, ANY in_progress execution is from a dead previous instance.
+  const staleAt = new Date(Date.now() - 31_000).toISOString();
+  const { data, error } = await supabase
+    .from('unipile_sequence_executions')
+    .update({ execution_state: 'not_started', updated_at: staleAt })
+    .eq('execution_state', 'in_progress')
+    .eq('status', 'running')
+    .select('id');
+  if (error) {
+    console.error('❌ Startup: failed to reset in_progress orphans:', error.message);
+  } else {
+    console.log(`🔧 Startup: reset ${data?.length ?? 0} in_progress orphan(s) from previous session`);
+  }
+}
 
 async function runWatchdog() {
   if (watchdogRunning) return;
   watchdogRunning = true;
   try {
-    // Don't check until the process has had enough time to warm up
-    if (process.uptime() * 1000 < WORKER_STALE_MS) return;
+    if (process.uptime() * 1000 < WATCHDOG_WARMUP_MS) return;
+    if (workerHealth.workerRestarting) return;
 
     const lastCompleted = workerHealth.lastJobCompletedAt?.getTime() ?? 0;
     const isStale = lastCompleted === 0 || Date.now() - lastCompleted > WORKER_STALE_MS;
-    if (!isStale || workerHealth.workerRestarting) return;
+    if (!isStale) return;
 
     let pending = 0;
     try {
@@ -31,7 +59,7 @@ async function runWatchdog() {
       ]);
       pending = waiting + active + delayed;
     } catch {
-      return; // Redis issue — can't check
+      return; // Redis issue — skip this cycle
     }
 
     if (pending === 0) return;
@@ -39,7 +67,7 @@ async function runWatchdog() {
     const staleSeconds = lastCompleted
       ? Math.round((Date.now() - lastCompleted) / 1000)
       : Math.round(process.uptime());
-    console.error(`🚨 CRITICAL: Worker consumer stale for ${staleSeconds}s with ${pending} pending jobs — restarting consumer`);
+    console.error(`🚨 CRITICAL: Worker consumer stale for ${staleSeconds}s with ${pending} pending jobs — restarting`);
 
     workerHealth.workerRestarting = true;
     try {
@@ -47,9 +75,12 @@ async function runWatchdog() {
         await workerHealth.worker.close();
         workerHealth.worker = null;
       }
-      workerHealth.lastJobCompletedAt = null; // reset so watchdog doesn't re-fire immediately
+      await drainExecutionQueue();
+      workerHealth.lastJobCompletedAt = null;
       startExecutionWorker();
       console.log('✅ Worker consumer restarted by watchdog');
+      // Kick off an immediate scan so fresh jobs are enqueued with the current SESSION_ID
+      setTimeout(() => triggerImmediateScan().catch(console.error), 500);
     } catch (err: any) {
       console.error('❌ Watchdog failed to restart worker consumer:', err.message);
     } finally {
@@ -62,26 +93,70 @@ async function runWatchdog() {
 
 async function main() {
   console.log('🚀 Outreach Worker starting...');
+  console.log(`   Session: ${SESSION_ID}`);
   console.log(`   Supabase: ${config.supabase.url}`);
   console.log(`   Redis: ${config.redis.url.replace(/\/\/.*@/, '//***@')}`);
+
+  // Catch process-level crashes so we get a stack trace before Railway restarts us.
+  // Helps diagnose OOM kills vs logic crashes vs Redis disconnects.
+  process.on('uncaughtException', (err) => {
+    console.error('💥 Uncaught exception — process will exit:', err.stack ?? err.message);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('💥 Unhandled rejection:', reason instanceof Error ? reason.stack : reason);
+  });
 
   // Redis connection event logging
   connection.on('connect', () => console.log('✅ Redis connection established'));
   connection.on('close', () => console.error('❌ Redis connection closed'));
   connection.on('reconnecting', (delay: number) => console.warn(`⚠️ Redis reconnecting in ${delay}ms...`));
-  connection.on('error', (err: Error) => console.error('❌ Redis error:', err.message));
+  connection.on('error', (err: Error) => console.error('❌ Redis error:', err.stack ?? err.message));
 
   // Verify Redis connection
   await connection.ping();
   console.log('✅ Redis connected');
+
+  // ── Startup recovery ──────────────────────────────────────────────────
+  // 1. Drain stale jobs from the previous session so the new SESSION_ID
+  //    starts with a clean slate (old failed/stale jobs won't block enqueues).
+  await drainExecutionQueue();
+
+  // 2. Reset all in_progress executions — they belong to the dead previous
+  //    instance and will never complete without a reset.
+  await resetInProgressOrphans();
+  // ─────────────────────────────────────────────────────────────────────
 
   // Start workers
   startExecutionWorker();
   startBatchWorker();
   await startScanner();
 
-  // Watchdog: restart worker consumer if it stops processing jobs
-  setInterval(runWatchdog, 60_000);
+  // Watchdog: check every 15s, restart if stale for 60s with pending work
+  setInterval(runWatchdog, 15_000);
+
+  // Heartbeat: log worker health every 30s for post-mortem diagnosis
+  setInterval(async () => {
+    const lastCompleted = workerHealth.lastJobCompletedAt;
+    const ageSeconds = lastCompleted
+      ? Math.round((Date.now() - lastCompleted.getTime()) / 1000)
+      : null;
+    let pending = -1;
+    try {
+      const [w, a, d] = await Promise.all([
+        executionQueue.getWaitingCount(),
+        executionQueue.getActiveCount(),
+        executionQueue.getDelayedCount(),
+      ]);
+      pending = w + a + d;
+    } catch { /* ignore */ }
+    const mem = process.memoryUsage();
+    console.log(
+      `[heartbeat] session=${SESSION_ID} worker=${!!workerHealth.worker} ` +
+      `lastCompleted=${ageSeconds !== null ? `${ageSeconds}s ago` : 'never'} ` +
+      `pending=${pending} redis=${connection.status} ` +
+      `mem=${Math.round(mem.heapUsed / 1024 / 1024)}MB/${Math.round(mem.rss / 1024 / 1024)}MB`
+    );
+  }, 30_000);
 
   // HTTP server for health checks + Bull Board
   const app = express();
@@ -89,7 +164,7 @@ async function main() {
   app.get('/health', async (_req, res) => {
     const now = Date.now();
     const lastCompleted = workerHealth.lastJobCompletedAt?.getTime() ?? 0;
-    const workerStale = process.uptime() * 1000 > WORKER_STALE_MS &&
+    const workerStale = process.uptime() * 1000 > WATCHDOG_WARMUP_MS &&
       (lastCompleted === 0 || now - lastCompleted > WORKER_STALE_MS);
     const scannerStale = !workerHealth.lastScannerRunAt ||
       now - workerHealth.lastScannerRunAt.getTime() > SCANNER_STALE_MS;
@@ -112,6 +187,7 @@ async function main() {
 
     res.status(healthy ? 200 : 503).json({
       status: healthy ? 'ok' : 'unhealthy',
+      session: SESSION_ID,
       uptime: Math.round(process.uptime()),
       worker: {
         lastJobCompletedAt: workerHealth.lastJobCompletedAt,
@@ -123,6 +199,10 @@ async function main() {
         stale: scannerStale,
       },
       queue: { pending, redisOk },
+      memory: {
+        heapMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      },
     });
   });
 
@@ -138,6 +218,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('Fatal error:', err);
+  console.error('Fatal error:', err.stack ?? err);
   process.exit(1);
 });

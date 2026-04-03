@@ -1,8 +1,14 @@
 import { Worker, Job } from 'bullmq';
+import { randomBytes } from 'crypto';
 import { connection, executionQueue, batchQueue, scannerQueue, recoveryQueue } from './queues/definitions';
 import { supabase } from './supabase';
 import { config } from './config';
 import { workerHealth } from './health';
+
+// One random 4-byte hex per process lifetime.
+// Stable within a session (prevents queue pile-up), unique across restarts
+// (prevents dead failed/stale jobs from blocking new enqueues with the same execution+step pair).
+export const SESSION_ID = randomBytes(4).toString('hex');
 
 const LINKEDIN_STEP_TYPES = [
   'linkedin_invitation', 'linkedin_message', 'linkedin_profile_visit',
@@ -157,10 +163,12 @@ async function scanAndEnqueue() {
           delay = batchIndex * (config.emailInterSendDelayMs + Math.random() * config.emailJitterMs);
         }
 
-        // Stable jobId: BullMQ deduplicates if this job is already waiting/delayed,
-        // preventing the queue from accumulating thousands of duplicate jobs when
-        // the worker is backlogged and updated_at never changes.
-        const jobId = `exec-${exec.id}-${exec.current_step_id}`;
+        // Session-scoped stable jobId:
+        //   - Stable within a session → BullMQ deduplicates waiting/delayed jobs,
+        //     preventing queue pile-up when the worker is backlogged.
+        //   - Session suffix rotates on every process restart → old failed/stale jobs
+        //     from the previous session can't block new enqueues (the permanent deadlock fix).
+        const jobId = `exec-${exec.id}-${exec.current_step_id}-${SESSION_ID}`;
         console.log(`Scanner: enqueueing exec=${exec.id} jobId=${jobId} delay=${Math.round(delay)}ms`);
 
         try {
@@ -354,8 +362,12 @@ export async function startScanner() {
     await recoveryPass();
   }, { connection, concurrency: 1 });
 
-  // Also run one scan immediately on start
-  await scanAndEnqueue();
+  console.log(`✅ Scanner started (session=${SESSION_ID}, interval: ${config.scanIntervalMs / 1000}s, recovery: 5min, limit: ${config.scanLimit})`);
+}
 
-  console.log(`✅ Scanner started (interval: ${config.scanIntervalMs / 1000}s, recovery: 5min, limit: ${config.scanLimit})`);
+/** Run a scanner cycle immediately (used by watchdog after worker restart). */
+export async function triggerImmediateScan(): Promise<void> {
+  console.log('🔍 Watchdog-triggered scan starting...');
+  await scanAndEnqueue();
+  console.log('🔍 Watchdog-triggered scan complete');
 }

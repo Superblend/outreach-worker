@@ -1498,11 +1498,19 @@ export function startExecutionWorker() {
   });
 
   worker.on('error', (err) => {
-    console.error(`❌ [worker=outreach-executions] Worker error:`, err.message);
+    console.error(`❌ [worker=outreach-executions] Worker error:`, err.stack ?? err.message);
   });
 
   worker.on('stalled', (jobId) => {
     console.warn(`⚠️ [worker=outreach-executions] Job stalled and returned to queue: jobId=${jobId}`);
+  });
+
+  worker.on('closing', () => {
+    console.warn(`⚠️ [worker=outreach-executions] Worker closing — consumer will stop processing`);
+  });
+
+  worker.on('closed', () => {
+    console.warn(`⚠️ [worker=outreach-executions] Worker closed`);
   });
 
   console.log(`✅ BullMQ processor listening on queue 'outreach-executions' (concurrency=${config.workerConcurrency}, rate=${config.workerRateLimit}/min)`);
