@@ -155,7 +155,10 @@ async function scanAndEnqueue() {
           delay = batchIndex * (config.emailInterSendDelayMs + Math.random() * config.emailJitterMs);
         }
 
-        const jobId = `exec-${exec.id}-${exec.current_step_id}-${Date.now()}`;
+        // Stable jobId: BullMQ deduplicates if this job is already waiting/delayed,
+        // preventing the queue from accumulating thousands of duplicate jobs when
+        // the worker is backlogged and updated_at never changes.
+        const jobId = `exec-${exec.id}-${exec.current_step_id}`;
         console.log(`Scanner: enqueueing exec=${exec.id} jobId=${jobId} delay=${Math.round(delay)}ms`);
 
         try {
@@ -230,6 +233,29 @@ async function scanAndEnqueue() {
 async function recoveryPass() {
   const now = new Date();
   const nowIso = now.toISOString();
+
+  // Release orphaned in_progress claims (worker crashed mid-job > 10 min ago)
+  const orphanCutoff = new Date(now.getTime() - 10 * 60_000).toISOString();
+  const { data: orphans, error: orphanErr } = await supabase
+    .from('unipile_sequence_executions')
+    .select('id')
+    .eq('execution_state', 'in_progress')
+    .eq('status', 'running')
+    .lt('updated_at', orphanCutoff);
+
+  if (!orphanErr && orphans && orphans.length > 0) {
+    const staleAt = new Date(now.getTime() - 31_000).toISOString();
+    const { error: releaseErr } = await supabase
+      .from('unipile_sequence_executions')
+      .update({ execution_state: 'not_started', updated_at: staleAt })
+      .in('id', orphans.map((r: any) => r.id));
+    if (releaseErr) {
+      console.error(`❌ Recovery: failed to release orphaned claims:`, releaseErr.message);
+    } else {
+      console.log(`🔧 Recovery: released ${orphans.length} orphaned in_progress claims`);
+    }
+  }
+
   const recoveryWindowEnd = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
   const { data: stranded, error } = await supabase

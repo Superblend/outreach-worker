@@ -576,11 +576,14 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     const defaultLimit = messageType === 'linkedin_invitations' ? 30 : 50;
 
     if (accountId) {
-      const { data: limitResult } = await supabase.rpc('check_and_increment_daily_limit', {
+      const { data: limitResult, error: limitError } = await supabase.rpc('check_and_increment_daily_limit', {
         p_account_id: accountId,
         p_message_type: messageType,
         p_max_default: currentStep.configuration?.daily_limit || defaultLimit,
       });
+      if (limitError) {
+        console.error(`❌ [${execution_id}] check_and_increment_daily_limit RPC failed (${messageType}):`, limitError.message);
+      }
       console.log(`📊 Daily limit check result for ${execution_id} (${messageType}): ${JSON.stringify(limitResult)}`);
 
       if (limitResult && !limitResult.allowed) {
