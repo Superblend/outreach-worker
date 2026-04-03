@@ -1,5 +1,6 @@
 import { Worker, Job } from 'bullmq';
 import { connection, executionQueue } from '../queues/definitions';
+import { workerHealth } from '../health';
 import { supabase, invokeEdgeFunction } from '../supabase';
 import { config } from '../config';
 import { sendEmail } from '../lib/unipile-send-email';
@@ -1481,16 +1482,27 @@ export function startExecutionWorker() {
     }
   );
 
+  workerHealth.worker = worker;
+
   worker.on('active', (job) => {
     console.log(`▶️  [queue=outreach-executions] job=${job.id} active`);
+  });
+
+  worker.on('completed', (job) => {
+    workerHealth.lastJobCompletedAt = new Date();
+    console.log(`✅ [queue=outreach-executions] job=${job.id} completed`);
   });
 
   worker.on('failed', (job, err) => {
     console.error(`❌ [queue=outreach-executions] job=${job?.id} failed (attempt ${job?.attemptsMade}/${job?.opts?.attempts}):`, err.message);
   });
 
-  worker.on('completed', (job) => {
-    console.log(`✅ [queue=outreach-executions] job=${job.id} completed`);
+  worker.on('error', (err) => {
+    console.error(`❌ [worker=outreach-executions] Worker error:`, err.message);
+  });
+
+  worker.on('stalled', (jobId) => {
+    console.warn(`⚠️ [worker=outreach-executions] Job stalled and returned to queue: jobId=${jobId}`);
   });
 
   console.log(`✅ BullMQ processor listening on queue 'outreach-executions' (concurrency=${config.workerConcurrency}, rate=${config.workerRateLimit}/min)`);

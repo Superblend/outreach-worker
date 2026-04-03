@@ -2,6 +2,7 @@ import { Worker, Job } from 'bullmq';
 import { connection, executionQueue, batchQueue, scannerQueue, recoveryQueue } from './queues/definitions';
 import { supabase } from './supabase';
 import { config } from './config';
+import { workerHealth } from './health';
 
 const LINKEDIN_STEP_TYPES = [
   'linkedin_invitation', 'linkedin_message', 'linkedin_profile_visit',
@@ -19,6 +20,7 @@ function convertToUTC(dateStr: string, hour: number, minute: number, timezone: s
 }
 
 async function scanAndEnqueue() {
+  workerHealth.lastScannerRunAt = new Date();
   const now = new Date();
   const nowIso = now.toISOString();
   const updatedAtBuffer = new Date(now.getTime() - 30000).toISOString();
@@ -185,6 +187,20 @@ async function scanAndEnqueue() {
       }
 
       console.log(`📦 Enqueued ${enqueued}/${execs.length} jobs for ${groupKey}`);
+    }
+
+    // Mark all enqueued executions as touched so the scanner skips them for
+    // the next 30s instead of re-enqueuing the same stable jobId every cycle.
+    // BullMQ deduplicates stable jobIds anyway, but this keeps the logs clean.
+    if (validExecs.length > 0) {
+      const touchedAt = new Date().toISOString();
+      const ids = validExecs.map(e => e.id);
+      for (let i = 0; i < ids.length; i += 100) {
+        await supabase
+          .from('unipile_sequence_executions')
+          .update({ updated_at: touchedAt })
+          .in('id', ids.slice(i, i + 100));
+      }
     }
   }
 
