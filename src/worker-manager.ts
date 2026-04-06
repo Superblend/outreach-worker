@@ -17,17 +17,43 @@ class WorkerManager {
   async start(): Promise<void> {
     await this.reconcile();
     this.reconcileTimer = setInterval(
-      () => this.reconcile().catch(console.error),
+      () => this.reconcile().catch((err: any) =>
+        console.error('WorkerManager: reconcile interval error:', err.message),
+      ),
       RECONCILE_INTERVAL_MS,
     );
     console.log(`✅ WorkerManager started (reconcile every ${RECONCILE_INTERVAL_MS / 1000}s)`);
   }
 
+  /**
+   * Ensure a worker exists for the given account queue.
+   * Called directly by the scanner after each enqueue — does not depend on
+   * Redis key discovery, so it works regardless of KEYS/SCAN availability.
+   */
+  ensureWorker(queueName: string): void {
+    if (this.workers.has(queueName)) return;
+    const parsed = parseAccountQueue(queueName);
+    if (!parsed) {
+      console.warn(`WorkerManager: ensureWorker called with unrecognised queue name: ${queueName}`);
+      return;
+    }
+    const { channel, accountId } = parsed;
+    const worker = createAccountWorker(queueName, channel, accountId, () => {
+      this.workerLastActive.set(queueName, Date.now());
+    });
+    this.workers.set(queueName, worker);
+    this.workerLastActive.set(queueName, Date.now());
+    this.hasPendingJobs = true;
+    console.log(`🔧 WorkerManager: created ${channel} worker for ${accountId} (queue=${queueName}) [via ensureWorker]`);
+  }
+
   /** Scan Redis for account queues with pending jobs; create/close workers accordingly. */
   async reconcile(): Promise<void> {
+    console.log(`🔄 WorkerManager: reconcile starting (active workers=${this.workers.size})`);
     try {
       const activeQueues = await this.scanActiveQueues();
       this.hasPendingJobs = activeQueues.size > 0;
+      console.log(`🔄 WorkerManager: reconcile found ${activeQueues.size} active queue(s): ${[...activeQueues].join(', ') || '(none)'}`);
 
       // Create workers for queues that appeared since last reconcile
       for (const queueName of activeQueues) {
@@ -35,48 +61,78 @@ class WorkerManager {
           const parsed = parseAccountQueue(queueName);
           if (!parsed) continue;
           const { channel, accountId } = parsed;
-          const worker = createAccountWorker(queueName, channel, accountId, () => {
+          try {
+            const worker = createAccountWorker(queueName, channel, accountId, () => {
+              this.workerLastActive.set(queueName, Date.now());
+            });
+            this.workers.set(queueName, worker);
             this.workerLastActive.set(queueName, Date.now());
-          });
-          this.workers.set(queueName, worker);
-          this.workerLastActive.set(queueName, Date.now());
-          console.log(`🔧 WorkerManager: created ${channel} worker for ${accountId} (queue=${queueName})`);
+            console.log(`🔧 WorkerManager: created ${channel} worker for ${accountId} (queue=${queueName})`);
+          } catch (err: any) {
+            console.error(`WorkerManager: failed to create worker for ${queueName}:`, err.message);
+          }
         }
       }
 
       // Close workers whose queues have been empty for 5+ minutes
       for (const [queueName, lastActive] of this.workerLastActive) {
         if (activeQueues.has(queueName)) continue;
-        if (Date.now() - lastActive < WORKER_IDLE_TIMEOUT_MS) continue;
+        if (this.workers.has(queueName) && Date.now() - lastActive < WORKER_IDLE_TIMEOUT_MS) continue;
         const worker = this.workers.get(queueName);
         if (worker) {
-          await worker.close();
+          try {
+            await worker.close();
+          } catch (err: any) {
+            console.warn(`WorkerManager: error closing worker for ${queueName}:`, err.message);
+          }
           this.workers.delete(queueName);
           this.workerLastActive.delete(queueName);
           console.log(`🔧 WorkerManager: closed idle worker for ${queueName}`);
         }
       }
+
+      console.log(`🔄 WorkerManager: reconcile complete (active workers=${this.workers.size})`);
     } catch (err: any) {
-      console.error('WorkerManager: reconcile error:', err.message);
+      console.error('WorkerManager: reconcile top-level error:', err.stack ?? err.message);
     }
   }
 
-  /** Scan Redis for outreach-linkedin-* and outreach-email-* queues that have pending jobs. */
+  /**
+   * Scan Redis for outreach-linkedin-* and outreach-email-* queues that have pending jobs.
+   * Uses SCAN (cursor-based) instead of KEYS so it works on managed Redis providers
+   * (Upstash, Railway internal Redis) that disable the blocking KEYS command.
+   */
   private async scanActiveQueues(): Promise<Set<string>> {
     const found = new Set<string>();
-    const patterns = ['bull:outreach-linkedin-*:id', 'bull:outreach-email-*:id'];
+    const prefixes = ['bull:outreach-linkedin-', 'bull:outreach-email-'];
 
-    for (const pattern of patterns) {
-      let keys: string[];
+    for (const prefix of prefixes) {
+      const pattern = `${prefix}*:id`;
+      let keys: string[] = [];
+
+      // Try SCAN first (non-blocking, works everywhere)
       try {
-        keys = await connection.keys(pattern);
-      } catch {
-        continue;
+        keys = await this.scanKeys(pattern);
+        console.log(`WorkerManager: SCAN "${pattern}" → ${keys.length} key(s): ${keys.slice(0, 5).join(', ')}${keys.length > 5 ? '…' : ''}`);
+      } catch (scanErr: any) {
+        console.error(`WorkerManager: SCAN failed for pattern "${pattern}":`, scanErr.message);
+        // Fall back to KEYS if SCAN is somehow unavailable
+        try {
+          keys = await connection.keys(pattern);
+          console.log(`WorkerManager: KEYS fallback "${pattern}" → ${keys.length} key(s)`);
+        } catch (keysErr: any) {
+          console.error(`WorkerManager: KEYS also failed for pattern "${pattern}":`, keysErr.message);
+          continue;
+        }
       }
 
       for (const key of keys) {
-        const match = key.match(/^bull:(.+):id$/);
-        if (!match) continue;
+        // Key format: bull:outreach-linkedin-{accountId}:id
+        const match = key.match(/^bull:(outreach-(?:linkedin|email)-.+):id$/);
+        if (!match) {
+          console.warn(`WorkerManager: unexpected key format skipped: ${key}`);
+          continue;
+        }
         const queueName = match[1];
         try {
           const q = getAccountQueue(queueName);
@@ -85,11 +141,13 @@ class WorkerManager {
             q.getActiveCount(),
             q.getDelayedCount(),
           ]);
-          if (waiting + active + delayed > 0) {
+          const total = waiting + active + delayed;
+          console.log(`WorkerManager: queue ${queueName} → waiting=${waiting} active=${active} delayed=${delayed}`);
+          if (total > 0) {
             found.add(queueName);
           }
-        } catch {
-          // Queue may have been removed — skip
+        } catch (err: any) {
+          console.warn(`WorkerManager: could not check counts for ${queueName}:`, err.message);
         }
       }
     }
@@ -97,21 +155,39 @@ class WorkerManager {
     return found;
   }
 
+  /** Cursor-based SCAN — O(1) per call, safe on all Redis providers. */
+  private async scanKeys(pattern: string): Promise<string[]> {
+    const results: string[] = [];
+    let cursor = '0';
+    do {
+      const [nextCursor, batch] = await connection.scan(cursor, 'MATCH', pattern, 'COUNT', 200);
+      results.push(...batch);
+      cursor = nextCursor;
+    } while (cursor !== '0');
+    return results;
+  }
+
   /** Drain all per-account queues. Called on startup to clear stale session jobs. */
   async drainAllAccountQueues(): Promise<void> {
-    const patterns = ['bull:outreach-linkedin-*:id', 'bull:outreach-email-*:id'];
+    let keys: string[] = [];
+    for (const prefix of ['bull:outreach-linkedin-', 'bull:outreach-email-']) {
+      try {
+        const batch = await this.scanKeys(`${prefix}*:id`);
+        keys.push(...batch);
+      } catch (err: any) {
+        console.warn(`WorkerManager: drainAllAccountQueues scan error for ${prefix}:`, err.message);
+      }
+    }
+
     let drained = 0;
-    for (const pattern of patterns) {
-      const keys = await connection.keys(pattern).catch(() => [] as string[]);
-      for (const key of keys) {
-        const match = key.match(/^bull:(.+):id$/);
-        if (!match) continue;
-        try {
-          await getAccountQueue(match[1]).drain();
-          drained++;
-        } catch (e: any) {
-          console.warn(`WorkerManager: drain error for ${match[1]}:`, e.message);
-        }
+    for (const key of keys) {
+      const match = key.match(/^bull:(outreach-(?:linkedin|email)-.+):id$/);
+      if (!match) continue;
+      try {
+        await getAccountQueue(match[1]).drain();
+        drained++;
+      } catch (e: any) {
+        console.warn(`WorkerManager: drain error for ${match[1]}:`, e.message);
       }
     }
     if (drained > 0) {

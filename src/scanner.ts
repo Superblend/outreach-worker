@@ -5,6 +5,7 @@ import { supabase } from './supabase';
 import { config } from './config';
 import { workerHealth } from './health';
 import { localMinutesOfDay, localDateString, localWeekday } from './lib/time-utils';
+import { workerManager } from './worker-manager';
 
 // One random 4-byte hex per process lifetime.
 // Stable within a session (prevents queue pile-up), unique across restarts
@@ -215,6 +216,12 @@ async function scanAndEnqueue() {
         } catch (enqueueErr: any) {
           console.error(`Scanner: ❌ Failed to enqueue exec=${exec.id}:`, enqueueErr.message);
         }
+      }
+
+      // Spawn a worker for this account queue immediately if one doesn't exist yet.
+      // This is the primary mechanism — don't wait for the 30s reconcile cycle.
+      if (targetQueueName !== 'outreach-executions' && enqueued > 0) {
+        workerManager.ensureWorker(targetQueueName);
       }
 
       console.log(`📦 Enqueued ${enqueued}/${execs.length} jobs for ${groupKey} → ${targetQueueName}`);
