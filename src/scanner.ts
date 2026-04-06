@@ -1,6 +1,6 @@
 import { Worker, Job } from 'bullmq';
 import { randomBytes } from 'crypto';
-import { connection, executionQueue, batchQueue, scannerQueue, recoveryQueue } from './queues/definitions';
+import { connection, executionQueue, batchQueue, scannerQueue, recoveryQueue, getAccountQueue } from './queues/definitions';
 import { supabase } from './supabase';
 import { config } from './config';
 import { workerHealth } from './health';
@@ -43,7 +43,7 @@ async function scanAndEnqueue() {
       assigned_linkedin_account_id, assigned_email_account_id,
       unipile_sequences!inner(
         status, scheduled_start_time, scheduled_end_time,
-        timezone, active_days, client_id, use_bullmq
+        timezone, active_days, client_id, use_bullmq, worker_partition
       ),
       unipile_sequence_steps!unipile_sequence_executions_current_step_id_fkey(step_type)
     `)
@@ -122,12 +122,26 @@ async function scanAndEnqueue() {
       validExecs.push(exec);
     }
 
-    // Group by account+channel and enqueue with appropriate delays
-    const groups = new Map<string, Array<typeof validExecs[0]>>();
-    
-    console.log(`Scanner: ${validExecs.length} executions passed time/day filters (of ${dueExecutions.length} found)`);
+    // Client partitioning: each worker replica handles a subset of clients
+    const PARTITION = config.partition;
+    const PARTITION_COUNT = config.partitionCount;
+    const partitioned = PARTITION_COUNT <= 1
+      ? validExecs
+      : validExecs.filter(exec => {
+          const wp: number = (exec.unipile_sequences as any)?.worker_partition ?? 0;
+          return (wp % PARTITION_COUNT) === PARTITION;
+        });
 
-    for (const exec of validExecs) {
+    // Group by account+channel and enqueue with appropriate delays
+    const groups = new Map<string, Array<typeof partitioned[0]>>();
+
+    console.log(
+      `Scanner: ${validExecs.length} passed time/day filters → ` +
+      `${partitioned.length} assigned to partition ${PARTITION}/${PARTITION_COUNT} ` +
+      `(of ${dueExecutions.length} found)`
+    );
+
+    for (const exec of partitioned) {
       // Normalize: PostgREST may return steps as an object or a single-element array
       const rawStepData = exec.unipile_sequence_steps as any;
       const stepData = Array.isArray(rawStepData) ? rawStepData[0] : rawStepData;
@@ -148,23 +162,30 @@ async function scanAndEnqueue() {
       groups.get(key)!.push(exec);
     }
 
-    // Enqueue jobs with staggered delays per account group
+    // Enqueue jobs into per-account queues (LinkedIn/email) or shared queue (other).
+    // No scanner-side delays for per-account queues — each account worker enforces its
+    // own pacing (45-90s LinkedIn / 10-20s email) via the Lua slot script.
     for (const [groupKey, execs] of groups) {
-      const [channel] = groupKey.split(':');
+      const [channel, accountId] = groupKey.split(':');
       let enqueued = 0;
+
+      // Determine target queue:
+      //   linkedin/email → dedicated per-account queue (WorkerManager creates the worker)
+      //   other          → shared outreach-executions queue (handled by startExecutionWorker)
+      let targetQueueName: string;
+      if (channel === 'linkedin' && accountId && accountId !== 'unknown') {
+        targetQueueName = `outreach-linkedin-${accountId}`;
+      } else if (channel === 'email' && accountId && accountId !== 'unknown') {
+        targetQueueName = `outreach-email-${accountId}`;
+      } else {
+        targetQueueName = 'outreach-executions';
+      }
+      const targetQueue = targetQueueName === 'outreach-executions'
+        ? executionQueue
+        : getAccountQueue(targetQueueName);
 
       for (let i = 0; i < execs.length; i++) {
         const exec = execs[i];
-        let delay = 0;
-
-        if (channel === 'linkedin') {
-          // Stagger within the group: i-th job delayed by i * (8-15s)
-          delay = i * (config.linkedinInterSendDelayMs + Math.random() * config.linkedinJitterMs);
-        } else if (channel === 'email') {
-          // Small stagger for emails
-          const batchIndex = Math.floor(i / config.emailBatchSize);
-          delay = batchIndex * (config.emailInterSendDelayMs + Math.random() * config.emailJitterMs);
-        }
 
         // Session-scoped stable jobId:
         //   - Stable within a session → BullMQ deduplicates waiting/delayed jobs,
@@ -172,10 +193,10 @@ async function scanAndEnqueue() {
         //   - Session suffix rotates on every process restart → old failed/stale jobs
         //     from the previous session can't block new enqueues (the permanent deadlock fix).
         const jobId = `exec-${exec.id}-${exec.current_step_id}-${SESSION_ID}`;
-        console.log(`Scanner: enqueueing exec=${exec.id} jobId=${jobId} delay=${Math.round(delay)}ms`);
+        console.log(`Scanner: enqueueing exec=${exec.id} queue=${targetQueueName} jobId=${jobId}`);
 
         try {
-          await executionQueue.add(
+          await targetQueue.add(
             'execute-step',
             {
               execution_id: exec.id,
@@ -183,7 +204,6 @@ async function scanAndEnqueue() {
               channel,
             },
             {
-              delay: Math.round(delay),
               attempts: 3,
               backoff: { type: 'exponential', delay: 5000 },
               jobId,
@@ -197,15 +217,15 @@ async function scanAndEnqueue() {
         }
       }
 
-      console.log(`📦 Enqueued ${enqueued}/${execs.length} jobs for ${groupKey}`);
+      console.log(`📦 Enqueued ${enqueued}/${execs.length} jobs for ${groupKey} → ${targetQueueName}`);
     }
 
     // Mark all enqueued executions as touched so the scanner skips them for
     // the next 30s instead of re-enqueuing the same stable jobId every cycle.
     // BullMQ deduplicates stable jobIds anyway, but this keeps the logs clean.
-    if (validExecs.length > 0) {
+    if (partitioned.length > 0) {
       const touchedAt = new Date().toISOString();
-      const ids = validExecs.map(e => e.id);
+      const ids = partitioned.map(e => e.id);
       for (let i = 0; i < ids.length; i += 100) {
         await supabase
           .from('unipile_sequence_executions')

@@ -7,6 +7,7 @@ import { setupBullBoard } from './monitoring/bull-board';
 import { connection, executionQueue } from './queues/definitions';
 import { workerHealth } from './health';
 import { supabase } from './supabase';
+import { workerManager } from './worker-manager';
 
 // Watchdog fires every 15s; triggers restart after 60s with no completed job + pending work.
 const WORKER_STALE_MS = 60_000;
@@ -52,12 +53,15 @@ async function runWatchdog() {
 
     let pending = 0;
     try {
+      // Check shared queue (delay/conditional steps) + WorkerManager knows account queue state
       const [waiting, active, delayed] = await Promise.all([
         executionQueue.getWaitingCount(),
         executionQueue.getActiveCount(),
         executionQueue.getDelayedCount(),
       ]);
       pending = waiting + active + delayed;
+      // Also treat pending account-queue jobs as signal that work exists
+      if (workerManager.hasPendingJobs) pending = Math.max(pending, 1);
     } catch {
       return; // Redis issue — skip this cycle
     }
@@ -78,6 +82,7 @@ async function runWatchdog() {
       await drainExecutionQueue();
       workerHealth.lastJobCompletedAt = null;
       startExecutionWorker();
+      await workerManager.restartAll();
       console.log('✅ Worker consumer restarted by watchdog');
       // Kick off an immediate scan so fresh jobs are enqueued with the current SESSION_ID
       setTimeout(() => triggerImmediateScan().catch(console.error), 500);
@@ -120,6 +125,7 @@ async function main() {
   // 1. Drain stale jobs from the previous session so the new SESSION_ID
   //    starts with a clean slate (old failed/stale jobs won't block enqueues).
   await drainExecutionQueue();
+  await workerManager.drainAllAccountQueues(); // drain per-account queues too
 
   // 2. Reset all in_progress executions — they belong to the dead previous
   //    instance and will never complete without a reset.
@@ -127,7 +133,8 @@ async function main() {
   // ─────────────────────────────────────────────────────────────────────
 
   // Start workers
-  startExecutionWorker();
+  startExecutionWorker();           // handles delay/conditional/other steps
+  await workerManager.start();      // manages per-account LinkedIn & email workers
   startBatchWorker();
   await startScanner();
 
@@ -152,6 +159,8 @@ async function main() {
     const mem = process.memoryUsage();
     console.log(
       `[heartbeat] session=${SESSION_ID} worker=${!!workerHealth.worker} ` +
+      `accountWorkers=${workerManager.getActiveWorkerCount()} ` +
+      `partition=${config.partition}/${config.partitionCount} ` +
       `lastCompleted=${ageSeconds !== null ? `${ageSeconds}s ago` : 'never'} ` +
       `pending=${pending} redis=${connection.status} ` +
       `mem=${Math.round(mem.heapUsed / 1024 / 1024)}MB/${Math.round(mem.rss / 1024 / 1024)}MB`
@@ -185,10 +194,18 @@ async function main() {
     const workerUnhealthy = workerStale && pending > 0;
     const healthy = redisOk && !workerUnhealthy && !scannerStale;
 
+    // Collect per-account queue stats (best-effort — skip on error)
+    let accountQueues: Array<{ queueName: string; pending: number; active: number }> = [];
+    try {
+      accountQueues = await workerManager.getWorkerStats();
+    } catch { /* non-fatal */ }
+
     res.status(healthy ? 200 : 503).json({
       status: healthy ? 'ok' : 'unhealthy',
       session: SESSION_ID,
       uptime: Math.round(process.uptime()),
+      partition: config.partition,
+      partitionCount: config.partitionCount,
       worker: {
         lastJobCompletedAt: workerHealth.lastJobCompletedAt,
         stale: workerStale,
@@ -199,6 +216,8 @@ async function main() {
         stale: scannerStale,
       },
       queue: { pending, redisOk },
+      activeAccountWorkers: workerManager.getActiveWorkerCount(),
+      accountQueues,
       memory: {
         heapMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
         rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024),

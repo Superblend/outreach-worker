@@ -1,5 +1,5 @@
 import { Worker, Job } from 'bullmq';
-import { connection, executionQueue } from '../queues/definitions';
+import { connection, executionQueue, getAccountQueue } from '../queues/definitions';
 import { workerHealth } from '../health';
 import { supabase, invokeEdgeFunction } from '../supabase';
 import { localMinutesOfDay, localDateString, localWeekday } from '../lib/time-utils';
@@ -1401,62 +1401,163 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   }
 }
 
+/**
+ * Creates a BullMQ Worker dedicated to one account's queue.
+ *
+ * LinkedIn workers: concurrency=1 (strictly sequential) so pacing gaps are natural.
+ * Email workers:    concurrency=3 (small parallel batches) still paced per account.
+ *
+ * When the pacing Lua script says "wait X ms", the job is requeued into the SAME
+ * per-account queue (not the shared outreach-executions queue) so other accounts
+ * are never blocked.
+ *
+ * @param onJobComplete Called after every successful job; used by WorkerManager to
+ *                      track idle time and by the health module to update lastJobCompletedAt.
+ */
+export function createAccountWorker(
+  queueName: string,
+  channel: 'linkedin' | 'email',
+  accountId: string,
+  onJobComplete: () => void,
+): Worker {
+  const stepResultWriter = new BatchWriter(supabase, 'unipile_step_results', {
+    onConflict: 'execution_id,step_id',
+  });
+  const concurrency = channel === 'linkedin' ? 1 : 3;
+  const accountQueue = getAccountQueue(queueName);
+
+  const worker = new Worker<ExecutionJobData>(
+    queueName,
+    async (job: Job<ExecutionJobData>) => {
+      const { execution_id, group_key } = job.data;
+      console.log(`🚀 [queue=${queueName} job=${job.id}] execution=${execution_id}`);
+
+      // Per-account LinkedIn pacing — requeue into THIS account's queue, not the shared one
+      if (channel === 'linkedin') {
+        const waitMs = await acquireLinkedInSlot(accountId);
+        if (waitMs > 0) {
+          const newJobId = `exec-${execution_id}-${Date.now()}`;
+          const requeueDelay = Math.round(waitMs) + Math.round(Math.random() * 5_000);
+          await accountQueue.add('execute-step', job.data, {
+            delay: requeueDelay,
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 5000 },
+            jobId: newJobId,
+            removeOnComplete: { age: 3600, count: 1000 },
+            removeOnFail: { age: 86400, count: 5000 },
+          });
+          console.log(
+            `⏳ [linkedin-pacing] exec=${execution_id} account=${accountId} requeued in ${Math.round(waitMs / 1000)}s`,
+          );
+          return;
+        }
+        console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${accountId} slot acquired`);
+      }
+
+      // Per-account email pacing — same pattern
+      if (channel === 'email') {
+        const waitMs = await acquireEmailSlot(accountId);
+        if (waitMs > 0) {
+          const newJobId = `exec-${execution_id}-${Date.now()}`;
+          await accountQueue.add('execute-step', job.data, {
+            delay: Math.round(waitMs),
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 5000 },
+            jobId: newJobId,
+            removeOnComplete: { age: 3600, count: 1000 },
+            removeOnFail: { age: 86400, count: 5000 },
+          });
+          console.log(
+            `⏳ [email-pacing] exec=${execution_id} account=${accountId} requeued in ${Math.round(waitMs / 1000)}s`,
+          );
+          return;
+        }
+        console.log(`✅ [email-pacing] exec=${execution_id} account=${accountId} slot acquired`);
+      }
+
+      try {
+        await executeStep(execution_id, stepResultWriter, job);
+      } catch (err: any) {
+        console.error(`❌ [queue=${queueName} job=${job.id}] Fatal error for ${execution_id}:`, err.message);
+
+        const { data: exec, error: fetchErr } = await supabase
+          .from('unipile_sequence_executions')
+          .select('status, retry_count')
+          .eq('id', execution_id)
+          .single();
+
+        if (fetchErr) {
+          console.error(`❌ Could not re-fetch execution ${execution_id}:`, fetchErr.message);
+        }
+
+        if (exec?.status === 'running') {
+          const retryCount = ((exec as any).retry_count || 0) + 1;
+          const retryDelayMs =
+            Math.pow(2, Math.min(retryCount - 1, 3)) * 60_000 + Math.random() * 30_000;
+          await supabase
+            .from('unipile_sequence_executions')
+            .update({
+              next_execution_at: new Date(Date.now() + retryDelayMs).toISOString(),
+              retry_count: retryCount,
+              error_message: err.message,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', execution_id);
+          console.log(
+            `🔄 Outer catch: retry ${execution_id} in ${Math.round(retryDelayMs / 1000)}s (retry_count=${retryCount})`,
+          );
+        }
+
+        throw err;
+      }
+    },
+    { connection, concurrency },
+  );
+
+  worker.on('active', (job) => {
+    console.log(`▶️  [queue=${queueName}] job=${job.id} active`);
+  });
+
+  worker.on('completed', (job) => {
+    workerHealth.lastJobCompletedAt = new Date();
+    onJobComplete();
+    console.log(`✅ [queue=${queueName}] job=${job.id} completed`);
+  });
+
+  worker.on('failed', (job, err) => {
+    console.error(
+      `❌ [queue=${queueName}] job=${job?.id} failed (attempt ${job?.attemptsMade}/${job?.opts?.attempts}):`,
+      err.message,
+    );
+  });
+
+  worker.on('error', (err) => {
+    console.error(`❌ [worker=${queueName}] Worker error:`, err.stack ?? err.message);
+  });
+
+  worker.on('stalled', (jobId) => {
+    console.warn(`⚠️ [worker=${queueName}] Job stalled: jobId=${jobId}`);
+  });
+
+  console.log(
+    `✅ BullMQ processor listening on '${queueName}' (concurrency=${concurrency})`,
+  );
+  return worker;
+}
+
 export function startExecutionWorker() {
   const supabaseRef = config.supabase.url.match(/https?:\/\/([^.]+)/)?.[1] || 'unknown';
   console.log(`🔗 Supabase project ref: ${supabaseRef}`);
 
   const stepResultWriter = new BatchWriter(supabase, 'unipile_step_results', { onConflict: 'execution_id,step_id' });
 
+  // outreach-executions now only handles non-LinkedIn/email steps (delay, conditional, etc.)
+  // LinkedIn and email jobs go to per-account queues managed by WorkerManager.
   const worker = new Worker<ExecutionJobData>(
     'outreach-executions',
     async (job: Job<ExecutionJobData>) => {
       const { execution_id, group_key, channel } = job.data;
       console.log(`🚀 [queue=outreach-executions job=${job.id}] execution=${execution_id} group=${group_key} channel=${channel}`);
-
-      // Per-account LinkedIn pacing: enforce 45-90s gap between consecutive actions
-      if (channel === 'linkedin') {
-        const accountId = group_key.split(':')[1];
-        if (accountId && accountId !== 'unknown') {
-          const waitMs = await acquireLinkedInSlot(accountId);
-          if (waitMs > 0) {
-            const newJobId = `exec-${execution_id}-${Date.now()}`;
-            const requeueDelay = Math.round(waitMs) + Math.round(Math.random() * 5_000);
-            await executionQueue.add('execute-step', job.data, {
-              delay: requeueDelay,
-              attempts: 3,
-              backoff: { type: 'exponential', delay: 5000 },
-              jobId: newJobId,
-              removeOnComplete: { age: 3600, count: 1000 },
-              removeOnFail: { age: 86400, count: 5000 },
-            });
-            console.log(`⏳ [linkedin-pacing] exec=${execution_id} account=${accountId} requeued in ${Math.round(waitMs / 1000)}s newJobId=${newJobId}`);
-            return;
-          }
-          console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${accountId} slot acquired waitMs=0`);
-        }
-      }
-
-      // Per-account email pacing: enforce 10-20s gap between consecutive sends
-      if (channel === 'email') {
-        const accountId = group_key.split(':')[1];
-        if (accountId && accountId !== 'unknown') {
-          const waitMs = await acquireEmailSlot(accountId);
-          if (waitMs > 0) {
-            const newJobId = `exec-${execution_id}-${Date.now()}`;
-            await executionQueue.add('execute-step', job.data, {
-              delay: Math.round(waitMs),
-              attempts: 3,
-              backoff: { type: 'exponential', delay: 5000 },
-              jobId: newJobId,
-              removeOnComplete: { age: 3600, count: 1000 },
-              removeOnFail: { age: 86400, count: 5000 },
-            });
-            console.log(`⏳ [email-pacing] exec=${execution_id} account=${accountId} requeued in ${Math.round(waitMs / 1000)}s newJobId=${newJobId}`);
-            return;
-          }
-          console.log(`✅ [email-pacing] exec=${execution_id} account=${accountId} slot acquired waitMs=0`);
-        }
-      }
 
       try {
         await executeStep(execution_id, stepResultWriter, job);
@@ -1494,11 +1595,8 @@ export function startExecutionWorker() {
     },
     {
       connection,
-      concurrency: config.workerConcurrency,
-      limiter: {
-        max: config.workerRateLimit,
-        duration: 60_000,
-      },
+      // Reduced concurrency: this queue only processes fast non-send steps (delay, conditional)
+      concurrency: 10,
     }
   );
 
@@ -1533,6 +1631,6 @@ export function startExecutionWorker() {
     console.warn(`⚠️ [worker=outreach-executions] Worker closed`);
   });
 
-  console.log(`✅ BullMQ processor listening on queue 'outreach-executions' (concurrency=${config.workerConcurrency}, rate=${config.workerRateLimit}/min)`);
+  console.log(`✅ BullMQ processor listening on queue 'outreach-executions' (concurrency=10, other steps only)`);
   return worker;
 }

@@ -43,4 +43,8 @@ export const config = {
 
   // Recovery interval
   recoveryIntervalMs: 5 * 60_000,
+
+  // Horizontal scaling: which partition this worker handles (0-based)
+  partition: parseInt(process.env.WORKER_PARTITION || '0', 10),
+  partitionCount: parseInt(process.env.WORKER_PARTITION_COUNT || '1', 10),
 };

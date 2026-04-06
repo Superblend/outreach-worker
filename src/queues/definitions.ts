@@ -18,3 +18,15 @@ export const executionEvents = new QueueEvents('outreach-executions', { connecti
 export const batchEvents = new QueueEvents('outreach-batches', { connection });
 
 export const allQueues = [executionQueue, batchQueue, scannerQueue, recoveryQueue];
+
+// Per-account queue factory — returns a cached Queue for outreach-linkedin-{id} / outreach-email-{id}
+const accountQueueCache = new Map<string, Queue>();
+
+export function getAccountQueue(queueName: string): Queue {
+  if (!accountQueueCache.has(queueName)) {
+    accountQueueCache.set(queueName, new Queue(queueName, { connection }));
+  }
+  return accountQueueCache.get(queueName)!;
+}
+
+export { accountQueueCache };
