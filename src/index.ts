@@ -15,6 +15,9 @@ const WATCHDOG_WARMUP_MS = 90_000; // wait for process to fully boot before firs
 const SCANNER_STALE_MS = 60_000;
 let watchdogRunning = false;
 
+// Set to true once all heavy init (Redis, workers, scanner) has completed.
+let initialized = false;
+
 async function drainExecutionQueue(): Promise<void> {
   try {
     await executionQueue.drain();
@@ -96,20 +99,11 @@ async function runWatchdog() {
   }
 }
 
-async function main() {
+async function initialize(): Promise<void> {
   console.log('🚀 Outreach Worker starting...');
   console.log(`   Session: ${SESSION_ID}`);
   console.log(`   Supabase: ${config.supabase.url}`);
   console.log(`   Redis: ${config.redis.url.replace(/\/\/.*@/, '//***@')}`);
-
-  // Catch process-level crashes so we get a stack trace before Railway restarts us.
-  // Helps diagnose OOM kills vs logic crashes vs Redis disconnects.
-  process.on('uncaughtException', (err) => {
-    console.error('💥 Uncaught exception — process will exit:', err.stack ?? err.message);
-  });
-  process.on('unhandledRejection', (reason) => {
-    console.error('💥 Unhandled rejection:', reason instanceof Error ? reason.stack : reason);
-  });
 
   // Redis connection event logging
   connection.on('connect', () => console.log('✅ Redis connection established'));
@@ -167,10 +161,35 @@ async function main() {
     );
   }, 30_000);
 
-  // HTTP server for health checks + Bull Board
+  initialized = true;
+  console.log('✅ Initialization complete');
+}
+
+async function main() {
+  // Catch process-level crashes so we get a stack trace before Railway restarts us.
+  process.on('uncaughtException', (err) => {
+    console.error('💥 Uncaught exception — process will exit:', err.stack ?? err.message);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('💥 Unhandled rejection:', reason instanceof Error ? reason.stack : reason);
+  });
+
+  // ── HTTP server starts FIRST so Railway healthchecks pass immediately ──
   const app = express();
 
   app.get('/health', async (_req, res) => {
+    // During startup, return 200 with ready:false so Railway doesn't kill us
+    // before initialization completes.
+    if (!initialized) {
+      res.status(200).json({
+        status: 'starting',
+        ready: false,
+        session: SESSION_ID,
+        uptime: Math.round(process.uptime()),
+      });
+      return;
+    }
+
     const now = Date.now();
     const lastCompleted = workerHealth.lastJobCompletedAt?.getTime() ?? 0;
     const workerStale = process.uptime() * 1000 > WATCHDOG_WARMUP_MS &&
@@ -202,6 +221,7 @@ async function main() {
 
     res.status(healthy ? 200 : 503).json({
       status: healthy ? 'ok' : 'unhealthy',
+      ready: true,
       session: SESSION_ID,
       uptime: Math.round(process.uptime()),
       partition: config.partition,
@@ -229,10 +249,20 @@ async function main() {
   const bullBoardAdapter = setupBullBoard();
   app.use('/admin/queues', bullBoardAdapter.getRouter());
 
-  app.listen(config.port, () => {
-    console.log(`✅ HTTP server on port ${config.port}`);
-    console.log(`   Health: http://localhost:${config.port}/health`);
-    console.log(`   Dashboard: http://localhost:${config.port}/admin/queues`);
+  // Start listening, then run heavy initialization in the background.
+  await new Promise<void>((resolve) => {
+    app.listen(config.port, () => {
+      console.log(`✅ HTTP server on port ${config.port}`);
+      console.log(`   Health: http://localhost:${config.port}/health`);
+      console.log(`   Dashboard: http://localhost:${config.port}/admin/queues`);
+      resolve();
+    });
+  });
+
+  // Heavy init runs after the server is already accepting connections.
+  initialize().catch((err) => {
+    console.error('Fatal initialization error:', err.stack ?? err);
+    process.exit(1);
   });
 }
 
