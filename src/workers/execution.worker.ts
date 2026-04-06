@@ -747,10 +747,31 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
           console.log(`📧 [${execution_id}] step=${currentStep.id} is_follow_up=true previous_found=${!!firstEmailResult} in_reply_to=${inReplyToMessageId || 'none'} original_subject="${originalSubject || 'none'}" final_subject="${cfg.subject || ''}"`);
         }
 
+        // Follow-up with no threading data and no subject: legacy campaign migrated from edge
+        // function. The step config has subject: null (by design — follow-ups inherit the thread
+        // subject). Fetch it from the first email step's configuration so we can send as a new
+        // email rather than crashing.
+        let emailSubject: string = cfg.subject || '';
+        if (!emailSubject.trim() && !inReplyToMessageId) {
+          const { data: firstEmailStep } = await (supabase
+            .from('unipile_sequence_steps')
+            .select('configuration')
+            .eq('unipile_sequence_id', execution.unipile_sequence_id)
+            .eq('step_type', 'email')
+            .order('step_order', { ascending: true })
+            .limit(1) as any).maybeSingle();
+
+          if (firstEmailStep?.configuration?.subject) {
+            emailSubject = firstEmailStep.configuration.subject;
+            console.log(`📧 [${execution_id}] Legacy follow-up: no subject in step config and no prior email result found — using fallback subject from first email step: "${emailSubject}"`);
+          }
+          // If still empty, sendEmail will return the 'Missing required subject' error naturally
+        }
+
         const result = await sendEmail({
           account_id: accountId,
           lead,
-          subject: cfg.subject || '',
+          subject: emailSubject,
           body: cfg.body || '',
           use_html: cfg.use_html || false,
           in_reply_to_message_id: inReplyToMessageId,
