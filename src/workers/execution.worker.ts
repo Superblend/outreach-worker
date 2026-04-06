@@ -194,10 +194,14 @@ async function enforceTimeWindow(proposedTime: Date, sequence: any): Promise<Dat
 
 async function smartReschedule(
   execution: any,
-  accountId: string,
-  messageType: string,
-  defaultLimit: number,
+  _accountId: string,
+  _messageType: string,
+  _defaultLimit: number,
 ): Promise<string> {
+  // Finds the next active working day and schedules within its window.
+  // Does NOT call check_and_increment_daily_limit — that RPC increments the
+  // counter and must only be called once, immediately before the API call in
+  // step 9 below. The limit will be re-checked when the execution runs again.
   const sequence = execution.unipile_sequences as any;
   const timezone = sequence?.timezone || 'UTC';
   const activeDays = sequence?.active_days || [0, 1, 2, 3, 4, 5, 6];
@@ -205,19 +209,11 @@ async function smartReschedule(
   const [endH, endM] = (sequence?.scheduled_end_time || '17:00').split(':').map(Number);
 
   const now = new Date();
-  for (let dayOffset = 0; dayOffset <= 14; dayOffset++) {
+  // Start from tomorrow — today's limit is already exhausted.
+  for (let dayOffset = 1; dayOffset <= 14; dayOffset++) {
     const candidate = new Date(now.getTime() + dayOffset * 86_400_000);
     const localDay = localWeekday(candidate, timezone);
     if (!activeDays.includes(localDay)) continue;
-
-    const { data: limitCheck } = await supabase.rpc('check_and_increment_daily_limit', {
-      p_account_id: accountId,
-      p_message_type: messageType,
-      p_max_default: defaultLimit,
-      p_dry_run: true,
-    });
-
-    if (limitCheck && !limitCheck.allowed) continue;
 
     const windowMs = (endH * 60 + endM - startH * 60 - startM) * 60 * 1000;
     const jitter = Math.random() * Math.min(windowMs, 3_600_000);
