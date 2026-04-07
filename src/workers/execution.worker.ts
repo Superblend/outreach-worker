@@ -25,7 +25,6 @@ const LINKEDIN_STEP_TYPES = [
 ];
 
 const SENDING_STEP_TYPES = ['linkedin_invitation', 'linkedin_message', 'email'];
-const GATING_STEP_TYPES = ['linkedin_invitation'];
 
 const LINKEDIN_PACING_MIN_MS = 45_000;
 const LINKEDIN_PACING_MAX_MS = 90_000;
@@ -1259,69 +1258,24 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     const maxRetries = 3;
     const retryable = isRetryableError(errMsg);
     const nonRetryable = isNonRetryableError(errMsg);
-    const isLastStep = !(await getNextStepId(currentStep.id));
-    const isGating = GATING_STEP_TYPES.includes(currentStep.step_type);
-
-    const isFollowUpRejection = errMsg.includes('follow_up_threading_rejected');
 
     if (nonRetryable || !retryable || attemptsMade >= maxRetries) {
-      if (isFollowUpRejection) {
-        await supabase.from('unipile_sequence_executions')
-          .update({
-            status: 'paused',
-            error_message: errMsg,
-            execution_log: [...executionLog, {
-              step_id: currentStep.id, step_type: currentStep.step_type,
-              action: 'follow_up_rejected_paused', error: errMsg,
-              executed_at: new Date().toISOString(),
-            }],
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', execution_id);
-        console.log(`⏸️ [${execution_id}] Follow-up email rejected (422), pausing for manual review`);
-      } else if (isGating && attemptsMade >= maxRetries) {
-        await supabase.from('unipile_sequence_executions')
-          .update({
-            status: 'paused',
-            execution_log: [...executionLog, {
-              step_id: currentStep.id, step_type: currentStep.step_type,
-              action: 'max_retries_gating_paused', error: errMsg,
-              executed_at: new Date().toISOString(),
-            }],
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', execution_id);
-        console.log(`⏸️ Gating max retries, pausing ${execution_id}`);
-      } else if (isLastStep || nonRetryable) {
-        await supabase.from('unipile_sequence_executions')
-          .update({
-            status: 'completed',
-            execution_log: [...executionLog, {
-              step_id: currentStep.id, step_type: currentStep.step_type,
-              action: 'failed_completed', error: errMsg,
-              executed_at: new Date().toISOString(),
-            }],
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', execution_id);
-      } else {
-        const skipNextStepId = await getNextStepId(currentStep.id);
-        if (skipNextStepId) {
-          const nextExecAt = await enforceTimeWindow(new Date(), sequence);
-          await supabase.from('unipile_sequence_executions')
-            .update({
-              current_step_id: skipNextStepId,
-              next_execution_at: nextExecAt.toISOString(),
-              execution_log: [...executionLog, {
-                step_id: currentStep.id, step_type: currentStep.step_type,
-                action: 'failed_skipped_to_next', error: errMsg,
-                executed_at: new Date().toISOString(),
-              }],
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', execution_id);
-        }
-      }
+      // Every step is gating: exhaust retries → complete with failure reason, never advance
+      const completedReason = `${currentStep.step_type}_failed`;
+      await supabase.from('unipile_sequence_executions')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          completed_reason: completedReason,
+          execution_log: [...executionLog, {
+            step_id: currentStep.id, step_type: currentStep.step_type,
+            action: 'failed_completed', error: errMsg,
+            executed_at: new Date().toISOString(),
+          }],
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', execution_id);
+      console.log(`❌ [${execution_id}] Step ${currentStep.step_type} failed (${errMsg}), marking execution completed (${completedReason})`);
     } else {
       // Schedule retry with exponential backoff + jitter
       const retryDelayMs = Math.pow(2, attemptsMade) * 60_000 + Math.random() * 30_000;
