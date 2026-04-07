@@ -152,7 +152,9 @@ async function scanAndEnqueue() {
       if (LINKEDIN_STEP_TYPES.includes(stepType)) {
         key = `linkedin:${exec.assigned_linkedin_account_id || 'unknown'}`;
       } else if (stepType === 'email') {
-        key = `email:${exec.assigned_email_account_id || 'unknown'}`;
+        // Email workers are per-client, not per-account
+        const clientId = (exec.unipile_sequences as any)?.client_id || 'unknown';
+        key = `email-client:${clientId}`;
       } else {
         key = `other:${exec.id}`;
       }
@@ -163,21 +165,24 @@ async function scanAndEnqueue() {
       groups.get(key)!.push(exec);
     }
 
-    // Enqueue jobs into per-account queues (LinkedIn/email) or shared queue (other).
-    // No scanner-side delays for per-account queues — each account worker enforces its
-    // own pacing (45-90s LinkedIn / 10-20s email) via the Lua slot script.
+    // Enqueue jobs into per-account queues (LinkedIn) or per-client queues (email)
+    // or shared queue (other). No scanner-side delays — each worker enforces its own
+    // pacing (45-90s LinkedIn per account / 2-3s email per client) via the Lua slot script.
     for (const [groupKey, execs] of groups) {
-      const [channel, accountId] = groupKey.split(':');
+      const colonIdx = groupKey.indexOf(':');
+      const channel = groupKey.slice(0, colonIdx);
+      const entityId = groupKey.slice(colonIdx + 1);
       let enqueued = 0;
 
       // Determine target queue:
-      //   linkedin/email → dedicated per-account queue (WorkerManager creates the worker)
-      //   other          → shared outreach-executions queue (handled by startExecutionWorker)
+      //   linkedin       → per-account queue (WorkerManager creates the worker)
+      //   email-client   → per-client queue  (WorkerManager creates the worker)
+      //   other          → shared outreach-executions queue
       let targetQueueName: string;
-      if (channel === 'linkedin' && accountId && accountId !== 'unknown') {
-        targetQueueName = `outreach-linkedin-${accountId}`;
-      } else if (channel === 'email' && accountId && accountId !== 'unknown') {
-        targetQueueName = `outreach-email-${accountId}`;
+      if (channel === 'linkedin' && entityId && entityId !== 'unknown') {
+        targetQueueName = `outreach-linkedin-${entityId}`;
+      } else if (channel === 'email-client' && entityId && entityId !== 'unknown') {
+        targetQueueName = `outreach-email-client-${entityId}`;
       } else {
         targetQueueName = 'outreach-executions';
       }
@@ -196,13 +201,16 @@ async function scanAndEnqueue() {
         const jobId = `exec-${exec.id}-${exec.current_step_id}-${SESSION_ID}`;
         console.log(`Scanner: enqueueing exec=${exec.id} queue=${targetQueueName} jobId=${jobId}`);
 
+        // Normalise channel for job data: 'email-client' → 'email' so the worker
+        // processor can still branch on channel === 'email'.
+        const jobChannel = channel === 'email-client' ? 'email' : channel;
         try {
           await targetQueue.add(
             'execute-step',
             {
               execution_id: exec.id,
               group_key: groupKey,
-              channel,
+              channel: jobChannel,
             },
             {
               attempts: 3,

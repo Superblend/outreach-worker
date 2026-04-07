@@ -58,8 +58,8 @@ async function acquireLinkedInSlot(accountId: string): Promise<number> {
   return waitMs;
 }
 
-const EMAIL_PACING_MIN_MS = 10_000;
-const EMAIL_PACING_MAX_MS = 20_000;
+const EMAIL_PACING_MIN_MS = 2_000;
+const EMAIL_PACING_MAX_MS = 3_000;
 const EMAIL_PACING_TTL_S = 120;
 
 const EMAIL_PACING_LUA = `
@@ -77,8 +77,8 @@ else
 end
 `;
 
-async function acquireEmailSlot(accountId: string): Promise<number> {
-  const key = `email:${accountId}`;
+async function acquireEmailSlot(clientId: string): Promise<number> {
+  const key = `pacing:email:client:${clientId}`;
   const now = Date.now();
   const gap = Math.round(EMAIL_PACING_MIN_MS + Math.random() * (EMAIL_PACING_MAX_MS - EMAIL_PACING_MIN_MS));
   const waitMs = await connection.eval(EMAIL_PACING_LUA, 1, key, String(now), String(gap), String(EMAIL_PACING_TTL_S)) as number;
@@ -1373,14 +1373,15 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
 }
 
 /**
- * Creates a BullMQ Worker dedicated to one account's queue.
+ * Creates a BullMQ Worker dedicated to one account/client queue.
  *
  * LinkedIn workers: concurrency=1 (strictly sequential) so pacing gaps are natural.
- * Email workers:    concurrency=3 (small parallel batches) still paced per account.
+ *                   One worker per LinkedIn account. `entityId` = accountId.
+ * Email workers:    concurrency=3 (small parallel batches) paced per client.
+ *                   One worker per client. `entityId` = clientId.
  *
  * When the pacing Lua script says "wait X ms", the job is requeued into the SAME
- * per-account queue (not the shared outreach-executions queue) so other accounts
- * are never blocked.
+ * queue so other accounts/clients are never blocked.
  *
  * @param onJobComplete Called after every successful job; used by WorkerManager to
  *                      track idle time and by the health module to update lastJobCompletedAt.
@@ -1388,7 +1389,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
 export function createAccountWorker(
   queueName: string,
   channel: 'linkedin' | 'email',
-  accountId: string,
+  entityId: string,
   onJobComplete: () => void,
 ): Worker {
   const stepResultWriter = new BatchWriter(supabase, 'unipile_step_results', {
@@ -1405,7 +1406,7 @@ export function createAccountWorker(
 
       // Per-account LinkedIn pacing — requeue into THIS account's queue, not the shared one
       if (channel === 'linkedin') {
-        const waitMs = await acquireLinkedInSlot(accountId);
+        const waitMs = await acquireLinkedInSlot(entityId);
         if (waitMs > 0) {
           const newJobId = `exec-${execution_id}-${Date.now()}`;
           const requeueDelay = Math.round(waitMs) + Math.round(Math.random() * 5_000);
@@ -1418,16 +1419,16 @@ export function createAccountWorker(
             removeOnFail: { age: 86400, count: 5000 },
           });
           console.log(
-            `⏳ [linkedin-pacing] exec=${execution_id} account=${accountId} requeued in ${Math.round(waitMs / 1000)}s`,
+            `⏳ [linkedin-pacing] exec=${execution_id} account=${entityId} requeued in ${Math.round(waitMs / 1000)}s`,
           );
           return;
         }
-        console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${accountId} slot acquired`);
+        console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${entityId} slot acquired`);
       }
 
-      // Per-account email pacing — same pattern
+      // Per-client email pacing — requeue into this client's queue
       if (channel === 'email') {
-        const waitMs = await acquireEmailSlot(accountId);
+        const waitMs = await acquireEmailSlot(entityId);
         if (waitMs > 0) {
           const newJobId = `exec-${execution_id}-${Date.now()}`;
           await accountQueue.add('execute-step', job.data, {
@@ -1439,11 +1440,11 @@ export function createAccountWorker(
             removeOnFail: { age: 86400, count: 5000 },
           });
           console.log(
-            `⏳ [email-pacing] exec=${execution_id} account=${accountId} requeued in ${Math.round(waitMs / 1000)}s`,
+            `⏳ [email-pacing] exec=${execution_id} client=${entityId} requeued in ${Math.round(waitMs / 1000)}s`,
           );
           return;
         }
-        console.log(`✅ [email-pacing] exec=${execution_id} account=${accountId} slot acquired`);
+        console.log(`✅ [email-pacing] exec=${execution_id} client=${entityId} slot acquired`);
       }
 
       try {

@@ -37,14 +37,14 @@ class WorkerManager {
       console.warn(`WorkerManager: ensureWorker called with unrecognised queue name: ${queueName}`);
       return;
     }
-    const { channel, accountId } = parsed;
-    const worker = createAccountWorker(queueName, channel, accountId, () => {
+    const { channel, entityId } = parsed;
+    const worker = createAccountWorker(queueName, channel, entityId, () => {
       this.workerLastActive.set(queueName, Date.now());
     });
     this.workers.set(queueName, worker);
     this.workerLastActive.set(queueName, Date.now());
     this.hasPendingJobs = true;
-    console.log(`🔧 WorkerManager: created ${channel} worker for ${accountId} (queue=${queueName}) [via ensureWorker]`);
+    console.log(`🔧 WorkerManager: created ${channel} worker for ${entityId} (queue=${queueName}) [via ensureWorker]`);
   }
 
   /** Scan Redis for account queues with pending jobs; create/close workers accordingly. */
@@ -60,14 +60,14 @@ class WorkerManager {
         if (!this.workers.has(queueName)) {
           const parsed = parseAccountQueue(queueName);
           if (!parsed) continue;
-          const { channel, accountId } = parsed;
+          const { channel, entityId } = parsed;
           try {
-            const worker = createAccountWorker(queueName, channel, accountId, () => {
+            const worker = createAccountWorker(queueName, channel, entityId, () => {
               this.workerLastActive.set(queueName, Date.now());
             });
             this.workers.set(queueName, worker);
             this.workerLastActive.set(queueName, Date.now());
-            console.log(`🔧 WorkerManager: created ${channel} worker for ${accountId} (queue=${queueName})`);
+            console.log(`🔧 WorkerManager: created ${channel} worker for ${entityId} (queue=${queueName})`);
           } catch (err: any) {
             console.error(`WorkerManager: failed to create worker for ${queueName}:`, err.message);
           }
@@ -104,7 +104,7 @@ class WorkerManager {
    */
   private async scanActiveQueues(): Promise<Set<string>> {
     const found = new Set<string>();
-    const prefixes = ['bull:outreach-linkedin-', 'bull:outreach-email-'];
+    const prefixes = ['bull:outreach-linkedin-', 'bull:outreach-email-client-'];
 
     for (const prefix of prefixes) {
       const pattern = `${prefix}*:id`;
@@ -127,8 +127,8 @@ class WorkerManager {
       }
 
       for (const key of keys) {
-        // Key format: bull:outreach-linkedin-{accountId}:id
-        const match = key.match(/^bull:(outreach-(?:linkedin|email)-.+):id$/);
+        // Key format: bull:outreach-linkedin-{accountId}:id or bull:outreach-email-client-{clientId}:id
+        const match = key.match(/^bull:(outreach-(?:linkedin|email-client)-.+):id$/);
         if (!match) {
           console.warn(`WorkerManager: unexpected key format skipped: ${key}`);
           continue;
@@ -170,7 +170,7 @@ class WorkerManager {
   /** Drain all per-account queues. Called on startup to clear stale session jobs. */
   async drainAllAccountQueues(): Promise<void> {
     let keys: string[] = [];
-    for (const prefix of ['bull:outreach-linkedin-', 'bull:outreach-email-']) {
+    for (const prefix of ['bull:outreach-linkedin-', 'bull:outreach-email-client-']) {
       try {
         const batch = await this.scanKeys(`${prefix}*:id`);
         keys.push(...batch);
@@ -181,7 +181,7 @@ class WorkerManager {
 
     let drained = 0;
     for (const key of keys) {
-      const match = key.match(/^bull:(outreach-(?:linkedin|email)-.+):id$/);
+      const match = key.match(/^bull:(outreach-(?:linkedin|email-client)-.+):id$/);
       if (!match) continue;
       try {
         await getAccountQueue(match[1]).drain();
@@ -241,12 +241,12 @@ class WorkerManager {
 
 function parseAccountQueue(
   queueName: string,
-): { channel: 'linkedin' | 'email'; accountId: string } | null {
+): { channel: 'linkedin' | 'email'; entityId: string } | null {
   if (queueName.startsWith('outreach-linkedin-')) {
-    return { channel: 'linkedin', accountId: queueName.slice('outreach-linkedin-'.length) };
+    return { channel: 'linkedin', entityId: queueName.slice('outreach-linkedin-'.length) };
   }
-  if (queueName.startsWith('outreach-email-')) {
-    return { channel: 'email', accountId: queueName.slice('outreach-email-'.length) };
+  if (queueName.startsWith('outreach-email-client-')) {
+    return { channel: 'email', entityId: queueName.slice('outreach-email-client-'.length) };
   }
   return null;
 }
