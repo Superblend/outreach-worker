@@ -26,9 +26,19 @@ export class BatchWriter {
     if (this.buffer.length === 0) return;
     const batch = this.buffer.splice(0, this.buffer.length);
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
-    const { error } = this.onConflict
-      ? await this.supabase.from(this.tableName).upsert(batch, { onConflict: this.onConflict, ignoreDuplicates: true })
-      : await this.supabase.from(this.tableName).insert(batch);
-    if (error) console.error(`Batch write to ${this.tableName} failed:`, error, 'payload keys:', Object.keys(batch[0] || {}));
+
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const { error } = this.onConflict
+        ? await this.supabase.from(this.tableName).upsert(batch, { onConflict: this.onConflict, ignoreDuplicates: true })
+        : await this.supabase.from(this.tableName).insert(batch);
+      if (!error) return;
+      if (attempt < maxAttempts) {
+        console.warn(`Batch write to ${this.tableName} failed (attempt ${attempt}/${maxAttempts}), retrying in 1s:`, error);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } else {
+        console.error(`Batch write to ${this.tableName} failed after ${maxAttempts} attempts:`, error, 'payload keys:', Object.keys(batch[0] || {}));
+      }
+    }
   }
 }

@@ -526,7 +526,33 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     }
   }
 
-  // 7. Duplicate execution check
+  // 7. Idempotency guard: check execution_log (in-memory, survives step_results loss and cascade deletes)
+  if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
+    const alreadySentInLog = executionLog.some(
+      (entry: any) => entry.step_id === currentStep.id && entry.action === 'completed'
+    );
+    if (alreadySentInLog) {
+      console.log(`⏭️ [${execution_id}] Idempotency guard: step ${currentStep.id} already completed per execution_log, advancing`);
+      const nextStepId = await getNextStepId(currentStep.id);
+      if (nextStepId) {
+        const nextExecAt = await enforceTimeWindow(new Date(), sequence);
+        await supabase.from('unipile_sequence_executions')
+          .update({
+            current_step_id: nextStepId,
+            next_execution_at: nextExecAt.toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', execution_id);
+      } else {
+        await supabase.from('unipile_sequence_executions')
+          .update({ status: 'completed', updated_at: new Date().toISOString() })
+          .eq('id', execution_id);
+      }
+      return;
+    }
+  }
+
+  // 8. Duplicate execution check (step_results table — secondary guard, may be missing if BatchWriter failed or step was cascade-deleted)
   if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
     const { data: existingResult } = await (supabase
       .from('unipile_step_results')
@@ -1350,9 +1376,42 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
 
   if (stepResult?.chat_id) advanceUpdate.chat_id = stepResult.chat_id;
 
-  await supabase.from('unipile_sequence_executions')
+  // Fix 3: verify next step exists before advancing (guards against phantom step IDs from sequence rebuilds)
+  const nextStepExists = steps.some((s: any) => s.id === nextStepId);
+  if (!nextStepExists) {
+    console.warn(`⚠️ [${execution_id}] Next step ${nextStepId} not found in sequence steps (deleted by rebuild?) — completing execution`);
+    await supabase.from('unipile_sequence_executions')
+      .update({
+        status: 'completed',
+        execution_log: [...executionLog, logEntry],
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', execution_id);
+    console.log(`✅ Execution ${execution_id} completed (next step not found)`);
+    return;
+  }
+
+  // Fix 1: capture advance error and handle FK violation explicitly
+  const { error: advanceError } = await supabase.from('unipile_sequence_executions')
     .update(advanceUpdate)
     .eq('id', execution_id);
+
+  if (advanceError) {
+    console.error(`❌ [${execution_id}] Advance failed: ${advanceError.message}`);
+    const isFkViolation = (advanceError as any).code === '23503';
+    if (isFkViolation) {
+      console.warn(`⚠️ [${execution_id}] Next step ${nextStepId} FK violation — step was deleted, completing execution`);
+      await supabase.from('unipile_sequence_executions')
+        .update({
+          status: 'completed',
+          execution_log: [...executionLog, logEntry],
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', execution_id);
+      console.log(`✅ Execution ${execution_id} completed (advance FK violation)`);
+    }
+    return;
+  }
 
   console.log(`➡️ Execution ${execution_id} advanced to step ${nextStepId}`);
 
