@@ -274,7 +274,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   if (leadId) {
     const { data: leadData, error: leadErr } = await supabase
       .from('leads')
-      .select('first_name, last_name, email, linkedin, company, position, industry')
+      .select('*')
       .eq('id', leadId)
       .single();
     if (leadErr) {
@@ -284,7 +284,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   } else if (contactId) {
     const { data: contactData, error: contactErr } = await supabase
       .from('contacts')
-      .select('first_name, last_name, email, linkedin, company, position, industry')
+      .select('*')
       .eq('id', contactId)
       .single();
     if (contactErr) {
