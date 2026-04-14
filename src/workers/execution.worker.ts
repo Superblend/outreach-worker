@@ -603,7 +603,33 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     }
   }
 
-  // 9. Daily limit check
+  // 9. Reply guard: if the lead already replied, completing this execution is the right
+  // outcome — don't send another message on top of their reply. Defense-in-depth for
+  // the edge case where the webhook was down or a race occurred between campaign resume
+  // and the worker picking up the job (webhook fixed on Lovable side but this catches misses).
+  if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
+    const { data: existingReply } = await (supabase
+      .from('unipile_message_events')
+      .select('id')
+      .eq('execution_id', execution_id)
+      .eq('event_type', 'message_received')
+      .limit(1) as any).maybeSingle();
+
+    if (existingReply) {
+      console.log(`⏹️ [${execution_id}] Reply already received (event ${existingReply.id}), marking completed`);
+      await supabase.from('unipile_sequence_executions')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          completed_reason: 'replied',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', execution_id);
+      return;
+    }
+  }
+
+  // 10. Daily limit check
   let preIncrementedAccountId: string | null = null;
   let preIncrementedMessageType: string | null = null;
 
@@ -1230,6 +1256,13 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   }
 
   await stepResultWriter.add(resultRecord);
+  // Flush immediately for sending steps so the secondary idempotency guard
+  // (step 8) always finds a step_result in DB before the claim is released.
+  // Without this, the BatchWriter's 5s async timer means a re-enqueued job
+  // could pass both guards and send a duplicate within that window.
+  if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
+    await stepResultWriter.flush();
+  }
 
   // 13. Rollback daily limit on failure
   if (!stepSuccess && preIncrementedAccountId) {
@@ -1370,7 +1403,6 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   const advanceUpdate: any = {
     current_step_id: nextStepId,
     next_execution_at: nextExecAt.toISOString(),
-    execution_log: [...executionLog, logEntry],
     updated_at: new Date().toISOString(),
   };
 
@@ -1391,6 +1423,23 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     return;
   }
 
+  // Write the execution_log completed entry BEFORE updating current_step_id.
+  // If the advance below fails for any non-FK reason (network blip, Supabase
+  // timeout), the idempotency guard (step 7) will find this entry on the next
+  // run and advance cleanly instead of re-sending. Without this split, a failed
+  // advance leaves execution_log without the completed entry and both guards fail.
+  const { error: logError } = await supabase.from('unipile_sequence_executions')
+    .update({
+      execution_log: [...executionLog, logEntry],
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', execution_id);
+
+  if (logError) {
+    console.error(`❌ [${execution_id}] Failed to write completed log entry: ${logError.message} — aborting advance to avoid unguarded re-send`);
+    return;
+  }
+
   // Fix 1: capture advance error and handle FK violation explicitly
   const { error: advanceError } = await supabase.from('unipile_sequence_executions')
     .update(advanceUpdate)
@@ -1401,15 +1450,16 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     const isFkViolation = (advanceError as any).code === '23503';
     if (isFkViolation) {
       console.warn(`⚠️ [${execution_id}] Next step ${nextStepId} FK violation — step was deleted, completing execution`);
+      // execution_log already written above with the completed entry
       await supabase.from('unipile_sequence_executions')
         .update({
           status: 'completed',
-          execution_log: [...executionLog, logEntry],
           updated_at: new Date().toISOString(),
         })
         .eq('id', execution_id);
       console.log(`✅ Execution ${execution_id} completed (advance FK violation)`);
     }
+    // execution_log already has the completed entry — next run will advance via guard
     return;
   }
 
