@@ -141,7 +141,12 @@ const LINKEDIN_CONNECTION_STEP_TYPES = ['linkedin_invitation', 'linkedin_message
 
 function isConnectionStatusError(message: string): boolean {
   const lower = message.toLowerCase();
-  return CONNECTION_STATUS_ERROR_PATTERNS.some(pattern => lower.includes(pattern));
+  if (CONNECTION_STATUS_ERROR_PATTERNS.some(pattern => lower.includes(pattern))) return true;
+  // Any 4xx from the profile fetch is terminal — the profile is inaccessible or the
+  // account is disabled/restricted. Only 5xx (transient server errors) should retry.
+  // "profile fetch failed: 4xx" — the '4' prefix catches 400, 403, 404, 422, etc.
+  if (lower.includes('profile fetch failed: 4')) return true;
+  return false;
 }
 
 function getConnectionStatusReason(message: string): string {
@@ -149,6 +154,10 @@ function getConnectionStatusReason(message: string): string {
   if (lower.includes('already connected') || lower.includes('connection exists')) return 'already_connected';
   if (lower.includes('pending invitation') || lower.includes('already_invited') || lower.includes('already_invited_recently')) return 'invitation_pending';
   if (lower.includes('profile not found')) return 'profile_not_found';
+  // 422 = account disabled or unavailable on Unipile's side
+  if (lower.includes('profile fetch failed: 422')) return 'linkedin_account_disabled';
+  // Other 4xx profile fetch failures (400, 403, 404) — profile inaccessible
+  if (lower.includes('profile fetch failed: 4')) return 'profile_not_found';
   return 'not_connected';
 }
 
