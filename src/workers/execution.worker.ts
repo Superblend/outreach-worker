@@ -638,7 +638,74 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     }
   }
 
-  // 10. Daily limit check
+  // 10. Email missing-address guard
+  // Must run before daily-limit increment and before any Unipile API call.
+  // Contact records often have no email; skip cleanly rather than burning retries.
+  if (currentStep.step_type === 'email') {
+    const emailAddr = (lead?.email as string | null | undefined)?.trim();
+    if (!emailAddr) {
+      console.log(`⏭️ [${execution_id}] No email address, skipping email step`);
+      await stepResultWriter.add({
+        execution_id,
+        step_id: currentStep.id,
+        lead_id: (execution as any).lead_id,
+        contact_id: (execution as any).contact_id,
+        step_type: 'email',
+        status: 'skipped',
+        error_message: 'No email address (contact)',
+      });
+      await stepResultWriter.flush();
+
+      const skipNextStepId = await getNextStepId(currentStep.id);
+      const skipLogEntry = {
+        step_id: currentStep.id,
+        step_type: 'email',
+        action: 'skipped',
+        executed_at: new Date().toISOString(),
+        result: { reason: 'no_email_address' },
+      };
+
+      if (skipNextStepId) {
+        const skipNextStep = steps.find((s: any) => s.id === skipNextStepId);
+        let skipNextExecAt: Date = new Date();
+        if (skipNextStep?.step_type === 'delay') {
+          const dv = skipNextStep.configuration?.delay_value || skipNextStep.delay_value || 1;
+          const du = skipNextStep.configuration?.delay_unit || skipNextStep.delay_unit || 'days';
+          const rawDate = new Date(Date.now() + calculateDelay(dv, du));
+          if (du === 'days' && sequence?.scheduled_start_time) {
+            const tz = sequence.timezone || 'UTC';
+            const [sH, sM] = sequence.scheduled_start_time.split(':').map(Number);
+            const targetDayStr = rawDate.toLocaleDateString('en-CA', { timeZone: tz });
+            skipNextExecAt = convertToUTC(targetDayStr, sH, sM, tz);
+          } else {
+            skipNextExecAt = rawDate;
+          }
+        }
+        skipNextExecAt = await enforceTimeWindow(skipNextExecAt, sequence);
+        await supabase.from('unipile_sequence_executions')
+          .update({
+            current_step_id: skipNextStepId,
+            next_execution_at: skipNextExecAt.toISOString(),
+            execution_log: [...executionLog, skipLogEntry],
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', execution_id);
+        console.log(`➡️ [${execution_id}] Skipped email step, advanced to ${skipNextStepId}`);
+      } else {
+        await supabase.from('unipile_sequence_executions')
+          .update({
+            status: 'completed',
+            execution_log: [...executionLog, skipLogEntry],
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', execution_id);
+        console.log(`✅ [${execution_id}] Skipped email step, execution completed (no next step)`);
+      }
+      return;
+    }
+  }
+
+  // 11. Daily limit check
   let preIncrementedAccountId: string | null = null;
   let preIncrementedMessageType: string | null = null;
 
