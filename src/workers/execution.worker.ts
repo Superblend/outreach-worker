@@ -2,7 +2,7 @@ import { Worker, Job } from 'bullmq';
 import { connection, executionQueue, getAccountQueue } from '../queues/definitions';
 import { workerHealth } from '../health';
 import { supabase, invokeEdgeFunction } from '../supabase';
-import { localMinutesOfDay, localDateString, localWeekday } from '../lib/time-utils';
+import { localMinutesOfDay, localDateString, localWeekday, isWithinActiveWindow, nextValidSendUtc } from '../lib/time-utils';
 import { config } from '../config';
 import { sendEmail } from '../lib/unipile-send-email';
 import { sendLinkedInInvitation } from '../lib/unipile-send-linkedin-invitation';
@@ -1589,6 +1589,30 @@ export function createAccountWorker(
       const { execution_id, group_key } = job.data;
       console.log(`🚀 [queue=${queueName} job=${job.id}] execution=${execution_id}`);
 
+      // Active-window guard — must run before pacing, daily limits, and any Unipile call.
+      // If the execution's next_execution_at landed on an inactive day/outside the sending
+      // window (common after delay math crosses a weekend), defer it to the next valid slot.
+      {
+        const { data: seqRow } = await supabase
+          .from('unipile_sequence_executions')
+          .select('next_execution_at, unipile_sequences(timezone, active_days, scheduled_start_time, scheduled_end_time)')
+          .eq('id', execution_id)
+          .single();
+        const seqMeta = (seqRow as any)?.unipile_sequences;
+        const guard = isWithinActiveWindow(seqMeta);
+        if (!guard.ok) {
+          const newTs = nextValidSendUtc(seqMeta);
+          await supabase
+            .from('unipile_sequence_executions')
+            .update({ next_execution_at: newTs, updated_at: new Date().toISOString() })
+            .eq('id', execution_id)
+            .eq('next_execution_at', seqRow?.next_execution_at) // CAS: only one racing worker wins
+            .select('id');
+          console.log(`⏸️ Execution ${execution_id} deferred (${guard.reason}) → ${newTs}`);
+          return; // ack the job — no pacing consumed, no daily limit, no step handler
+        }
+      }
+
       // Per-account LinkedIn pacing — requeue into THIS account's queue, not the shared one
       if (channel === 'linkedin') {
         const waitMs = await acquireLinkedInSlot(entityId);
@@ -1715,6 +1739,28 @@ export function startExecutionWorker() {
     async (job: Job<ExecutionJobData>) => {
       const { execution_id, group_key, channel } = job.data;
       console.log(`🚀 [queue=outreach-executions job=${job.id}] execution=${execution_id} group=${group_key} channel=${channel}`);
+
+      // Active-window guard — mirrors the guard in createAccountWorker.
+      {
+        const { data: seqRow } = await supabase
+          .from('unipile_sequence_executions')
+          .select('next_execution_at, unipile_sequences(timezone, active_days, scheduled_start_time, scheduled_end_time)')
+          .eq('id', execution_id)
+          .single();
+        const seqMeta = (seqRow as any)?.unipile_sequences;
+        const guard = isWithinActiveWindow(seqMeta);
+        if (!guard.ok) {
+          const newTs = nextValidSendUtc(seqMeta);
+          await supabase
+            .from('unipile_sequence_executions')
+            .update({ next_execution_at: newTs, updated_at: new Date().toISOString() })
+            .eq('id', execution_id)
+            .eq('next_execution_at', seqRow?.next_execution_at) // CAS: only one racing worker wins
+            .select('id');
+          console.log(`⏸️ Execution ${execution_id} deferred (${guard.reason}) → ${newTs}`);
+          return; // ack the job — no daily limit, no step handler
+        }
+      }
 
       try {
         await executeStep(execution_id, stepResultWriter, job);
