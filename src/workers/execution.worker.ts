@@ -38,15 +38,14 @@ const PACING_LUA = `
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
 local minGap = tonumber(ARGV[2])
-local ttl = tonumber(ARGV[3])
 local lastSend = redis.call('GET', key)
 if lastSend then
   local elapsed = now - tonumber(lastSend)
   if elapsed < minGap then
-    return minGap - elapsed
+    return redis.call('PTTL', key)
   end
 end
-redis.call('SET', key, tostring(now), 'EX', ttl)
+redis.call('SET', key, tostring(now), 'EX', math.ceil(minGap / 1000))
 return 0
 `;
 
@@ -66,14 +65,13 @@ const EMAIL_PACING_LUA = `
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
 local gap = tonumber(ARGV[2])
-local ttl = tonumber(ARGV[3])
 local last = tonumber(redis.call('GET', key) or '0')
 local elapsed = now - last
 if elapsed >= gap then
-  redis.call('SET', key, tostring(now), 'EX', ttl)
+  redis.call('SET', key, tostring(now), 'EX', math.ceil(gap / 1000))
   return 0
 else
-  return gap - elapsed
+  return redis.call('PTTL', key)
 end
 `;
 
@@ -1618,7 +1616,7 @@ export function createAccountWorker(
         const waitMs = await acquireLinkedInSlot(entityId);
         if (waitMs > 0) {
           const newJobId = `exec-${execution_id}-${Date.now()}`;
-          const requeueDelay = Math.round(waitMs) + Math.round(Math.random() * 5_000);
+          const requeueDelay = Math.max(waitMs, 1000) + Math.floor(Math.random() * 500);
           await accountQueue.add('execute-step', job.data, {
             delay: requeueDelay,
             attempts: 3,
@@ -1629,9 +1627,9 @@ export function createAccountWorker(
             removeOnFail: { age: 86400, count: 5000 },
           });
           console.log(
-            `⏳ [linkedin-pacing] exec=${execution_id} account=${entityId} requeued in ${Math.round(waitMs / 1000)}s`,
+            `⏳ [linkedin-pacing] exec=${execution_id} account=${entityId} requeued in ${Math.round(requeueDelay / 1000)}s`,
           );
-          await worker.rateLimit(waitMs);
+          await worker.rateLimit(requeueDelay);
           throw Worker.RateLimitError();
         }
         console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${entityId} slot acquired`);
@@ -1642,8 +1640,9 @@ export function createAccountWorker(
         const waitMs = await acquireEmailSlot(entityId);
         if (waitMs > 0) {
           const newJobId = `exec-${execution_id}-${Date.now()}`;
+          const requeueDelay = Math.max(waitMs, 1000) + Math.floor(Math.random() * 500);
           await accountQueue.add('execute-step', job.data, {
-            delay: Math.round(waitMs),
+            delay: requeueDelay,
             attempts: 3,
             backoff: { type: 'exponential', delay: 5000 },
             jobId: newJobId,
@@ -1652,9 +1651,9 @@ export function createAccountWorker(
             removeOnFail: { age: 86400, count: 5000 },
           });
           console.log(
-            `⏳ [email-pacing] exec=${execution_id} client=${entityId} requeued in ${Math.round(waitMs / 1000)}s`,
+            `⏳ [email-pacing] exec=${execution_id} client=${entityId} requeued in ${Math.round(requeueDelay / 1000)}s`,
           );
-          await worker.rateLimit(waitMs);
+          await worker.rateLimit(requeueDelay);
           throw Worker.RateLimitError();
         }
         console.log(`✅ [email-pacing] exec=${execution_id} client=${entityId} slot acquired`);
