@@ -210,12 +210,18 @@ async function scanAndEnqueue() {
       for (let i = 0; i < execs.length; i++) {
         const exec = execs[i];
 
+        // Re-derive stepType here — the grouping loop's stepType is out of scope.
+        const rawStep = exec.unipile_sequence_steps as any;
+        const stepData = Array.isArray(rawStep) ? rawStep[0] : rawStep;
+        const execStepType = stepData?.step_type || 'unknown';
+        const execStepId: string = exec.current_step_id;
+
         // Session-scoped stable jobId:
         //   - Stable within a session → BullMQ deduplicates waiting/delayed jobs,
         //     preventing queue pile-up when the worker is backlogged.
         //   - Session suffix rotates on every process restart → old failed/stale jobs
         //     from the previous session can't block new enqueues (the permanent deadlock fix).
-        const jobId = `exec-${exec.id}-${exec.current_step_id}-${SESSION_ID}`;
+        const jobId = `exec-${exec.id}-${execStepId}-${SESSION_ID}`;
         console.log(`Scanner: enqueueing exec=${exec.id} queue=${targetQueueName} jobId=${jobId}`);
 
         // Normalise channel for job data: 'email-client' → 'email' so the worker
@@ -235,8 +241,8 @@ async function scanAndEnqueue() {
               execution_id: exec.id,
               group_key: groupKey,
               channel: jobChannel,
-              step_id: exec.current_step_id,
-              step_type: stepType,
+              step_id: execStepId,
+              step_type: execStepType,
             },
             {
               attempts: 3,
@@ -249,7 +255,7 @@ async function scanAndEnqueue() {
           );
           enqueued++;
         } catch (enqueueErr: any) {
-          console.error(`Scanner: ❌ Failed to enqueue exec=${exec.id}:`, enqueueErr.message);
+          console.error(`Scanner: ❌ Failed to enqueue exec=${exec.id}:`, enqueueErr.stack ?? enqueueErr.message);
         }
       }
 
