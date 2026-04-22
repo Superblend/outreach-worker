@@ -1631,7 +1631,7 @@ export function createAccountWorker(
             `⏳ [linkedin-pacing] exec=${execution_id} account=${entityId} requeued in ${Math.round(waitMs / 1000)}s`,
           );
           await worker.rateLimit(waitMs);
-          return;
+          throw Worker.RateLimitError();
         }
         console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${entityId} slot acquired`);
       }
@@ -1653,7 +1653,7 @@ export function createAccountWorker(
             `⏳ [email-pacing] exec=${execution_id} client=${entityId} requeued in ${Math.round(waitMs / 1000)}s`,
           );
           await worker.rateLimit(waitMs);
-          return;
+          throw Worker.RateLimitError();
         }
         console.log(`✅ [email-pacing] exec=${execution_id} client=${entityId} slot acquired`);
       }
