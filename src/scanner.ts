@@ -27,6 +27,22 @@ function convertToUTC(dateStr: string, hour: number, minute: number, timezone: s
   return new Date(date.getTime() - offsetMs);
 }
 
+function cohortPriority(
+  cohort: string | null | undefined,
+  firstTouchDone: boolean,
+  nextExecutionAt: string,
+  now: number = Date.now()
+): number {
+  if (cohort === 'new_today') return firstTouchDone ? 2 : 1;
+  if (cohort === 'in_flight') {
+    const overdueMs = now - new Date(nextExecutionAt).getTime();
+    if (overdueMs > 86_400_000) return 3; // P3.a overdue >24h
+    if (overdueMs > 3_600_000)  return 4; // P3.b overdue 1–24h
+    return 5;                              // P3.c on-time / future
+  }
+  return 6; // low_priority / null
+}
+
 async function scanAndEnqueue() {
   workerHealth.lastScannerRunAt = new Date();
   const now = new Date();
@@ -42,6 +58,7 @@ async function scanAndEnqueue() {
       id, batch_number, next_execution_at, updated_at,
       unipile_sequence_id, current_step_id,
       assigned_linkedin_account_id, assigned_email_account_id,
+      priority_cohort, first_touch_done,
       unipile_sequences!inner(
         status, scheduled_start_time, scheduled_end_time,
         timezone, active_days, client_id, use_bullmq, worker_partition
@@ -204,6 +221,13 @@ async function scanAndEnqueue() {
         // Normalise channel for job data: 'email-client' → 'email' so the worker
         // processor can still branch on channel === 'email'.
         const jobChannel = channel === 'email-client' ? 'email' : channel;
+        const priority = targetQueueName !== 'outreach-executions'
+          ? cohortPriority(
+              (exec as any).priority_cohort,
+              (exec as any).first_touch_done === true,
+              exec.next_execution_at,
+            )
+          : undefined;
         try {
           await targetQueue.add(
             'execute-step',
@@ -216,6 +240,7 @@ async function scanAndEnqueue() {
               attempts: 3,
               backoff: { type: 'exponential', delay: 5000 },
               jobId,
+              ...(priority !== undefined && { priority }),
               removeOnComplete: { age: 3600, count: 1000 },
               removeOnFail: { age: 86400, count: 5000 },
             }

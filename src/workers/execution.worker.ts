@@ -1624,6 +1624,7 @@ export function createAccountWorker(
             attempts: 3,
             backoff: { type: 'exponential', delay: 5000 },
             jobId: newJobId,
+            priority: job.opts.priority,
             removeOnComplete: { age: 3600, count: 1000 },
             removeOnFail: { age: 86400, count: 5000 },
           });
@@ -1646,6 +1647,7 @@ export function createAccountWorker(
             attempts: 3,
             backoff: { type: 'exponential', delay: 5000 },
             jobId: newJobId,
+            priority: job.opts.priority,
             removeOnComplete: { age: 3600, count: 1000 },
             removeOnFail: { age: 86400, count: 5000 },
           });
