@@ -1,3 +1,4 @@
+import { randomBytes } from 'crypto';
 import { Worker, Job } from 'bullmq';
 import { connection, executionQueue, getAccountQueue } from '../queues/definitions';
 import { workerHealth } from '../health';
@@ -17,7 +18,24 @@ interface ExecutionJobData {
   execution_id: string;
   group_key: string;
   channel: string;
+  step_id?: string;   // current_step_id at enqueue time — used for freshness checks
+  step_type?: string; // step type at enqueue time — gates pacing to outbound steps only
 }
+
+// Stable per-process session ID — rotates on restart so pacing-defer jobIds never
+// collide with stale jobs from a previous session.
+const WORKER_SESSION_ID = randomBytes(4).toString('hex');
+
+// Only these step types make outbound LinkedIn API calls and should acquire a pacing slot.
+// Internal steps (delay, conditional, etc.) must bypass pacing even on a LinkedIn queue.
+const PACEABLE_LINKEDIN_STEP_TYPES = new Set([
+  'linkedin_invitation',
+  'linkedin_message',
+  'linkedin_profile_visit',
+  'linkedin_engage_post',
+  'linkedin_endorse',
+  'linkedin_voice_note',
+]);
 
 const LINKEDIN_STEP_TYPES = [
   'linkedin_invitation', 'linkedin_message', 'linkedin_profile_visit',
@@ -1584,8 +1602,39 @@ export function createAccountWorker(
   const worker = new Worker<ExecutionJobData>(
     queueName,
     async (job: Job<ExecutionJobData>) => {
-      const { execution_id, group_key } = job.data;
+      const { execution_id, group_key, step_id: stepId, step_type: stepType } = job.data;
       console.log(`🚀 [queue=${queueName} job=${job.id}] execution=${execution_id}`);
+
+      // ── Freshness check ──────────────────────────────────────────────────────────
+      // Must run before pacing acquisition. Stale/completed jobs must ack and die
+      // without burning a pacing slot or triggering worker.rateLimit.
+      if (stepId) {
+        const { data: freshRow } = await supabase
+          .from('unipile_sequence_executions')
+          .select('status, current_step_id')
+          .eq('id', execution_id)
+          .single();
+
+        if (!freshRow || freshRow.status !== 'running') {
+          console.log(`🪦 [stale-job] exec=${execution_id} step=${stepId} reason=status_not_running (${freshRow?.status ?? 'not_found'})`);
+          return;
+        }
+        if (freshRow.current_step_id !== stepId) {
+          console.log(`🪦 [stale-job] exec=${execution_id} step=${stepId} reason=step_advanced (current=${freshRow.current_step_id})`);
+          return;
+        }
+        const { data: existingResult } = await (supabase
+          .from('unipile_step_results')
+          .select('id')
+          .eq('execution_id', execution_id)
+          .eq('step_id', stepId)
+          .eq('status', 'success') as any).maybeSingle();
+        if (existingResult) {
+          console.log(`🪦 [stale-job] exec=${execution_id} step=${stepId} reason=already_succeeded`);
+          return;
+        }
+      }
+      // ────────────────────────────────────────────────────────────────────────────
 
       // Active-window guard — must run before pacing, daily limits, and any Unipile call.
       // If the execution's next_execution_at landed on an inactive day/outside the sending
@@ -1611,11 +1660,16 @@ export function createAccountWorker(
         }
       }
 
-      // Per-account LinkedIn pacing — requeue into THIS account's queue, not the shared one
-      if (channel === 'linkedin') {
+      // Per-account LinkedIn pacing — only for steps that actually call LinkedIn APIs.
+      // Internal steps (delay, conditional) must pass through without consuming a slot.
+      if (channel === 'linkedin' && PACEABLE_LINKEDIN_STEP_TYPES.has(stepType ?? '')) {
         const waitMs = await acquireLinkedInSlot(entityId);
         if (waitMs > 0) {
-          const newJobId = `exec-${execution_id}-${Date.now()}`;
+          // Stable jobId: deduplicates repeated requeues for the same execution-step
+          // within a worker session, preventing delayed-job pile-up.
+          const newJobId = stepId
+            ? `exec-${execution_id}-${stepId}-${WORKER_SESSION_ID}-pacing`
+            : `exec-${execution_id}-${Date.now()}`;
           const requeueDelay = Math.max(waitMs, 1000) + Math.floor(Math.random() * 500);
           await accountQueue.add('execute-step', job.data, {
             delay: requeueDelay,
@@ -1635,11 +1689,13 @@ export function createAccountWorker(
         console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${entityId} slot acquired`);
       }
 
-      // Per-client email pacing — requeue into this client's queue
-      if (channel === 'email') {
+      // Per-client email pacing — only for actual outbound email sends.
+      if (channel === 'email' && stepType === 'email') {
         const waitMs = await acquireEmailSlot(entityId);
         if (waitMs > 0) {
-          const newJobId = `exec-${execution_id}-${Date.now()}`;
+          const newJobId = stepId
+            ? `exec-${execution_id}-${stepId}-${WORKER_SESSION_ID}-pacing`
+            : `exec-${execution_id}-${Date.now()}`;
           const requeueDelay = Math.max(waitMs, 1000) + Math.floor(Math.random() * 500);
           await accountQueue.add('execute-step', job.data, {
             delay: requeueDelay,

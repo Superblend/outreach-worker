@@ -235,6 +235,8 @@ async function scanAndEnqueue() {
               execution_id: exec.id,
               group_key: groupKey,
               channel: jobChannel,
+              step_id: exec.current_step_id,
+              step_type: stepType,
             },
             {
               attempts: 3,
