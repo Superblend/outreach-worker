@@ -9,6 +9,9 @@ interface SendLinkedInMessageParams {
   message: string;
   use_inmail?: boolean;
   chat_id?: string;
+  /** When false, the LinkedIn invite endpoint is never called even if no chat_id is known.
+   *  Use for follow-up linkedin_message steps to prevent accidental invitation sends. */
+  allowInviteFallback?: boolean;
 }
 
 function extractLinkedInIdentifier(lead: any): string | null {
@@ -20,7 +23,7 @@ function extractLinkedInIdentifier(lead: any): string | null {
 }
 
 export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Promise<any> {
-  const { account_id, lead, use_inmail } = params;
+  const { account_id, lead, use_inmail, allowInviteFallback = true } = params;
   const apiUrl = config.unipile.apiUrl;
 
   // Resolve the Unipile account
@@ -76,38 +79,40 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
     return { success: false, error: 'Could not get provider_id from LinkedIn profile' };
   }
 
-  // Step 4: Try invite endpoint
-  const inviteRes = await unipileFetch(`${apiUrl}/api/v1/users/invite`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-API-KEY': config.unipile.apiKey },
-    body: JSON.stringify({ account_id: unipileAccountId, provider_id: providerId, message: personalizedMessage }),
-  });
+  // Step 4: Try invite endpoint (skipped for follow-up steps where allowInviteFallback=false)
+  if (allowInviteFallback) {
+    const inviteRes = await unipileFetch(`${apiUrl}/api/v1/users/invite`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': config.unipile.apiKey },
+      body: JSON.stringify({ account_id: unipileAccountId, provider_id: providerId, message: personalizedMessage }),
+    });
 
-  if (inviteRes.ok) {
-    const inviteData = await inviteRes.json().catch(() => null);
-    const inviteId = inviteData?.id || inviteData?.invitation_id || inviteData?.data?.id;
+    if (inviteRes.ok) {
+      const inviteData = await inviteRes.json().catch(() => null);
+      const inviteId = inviteData?.id || inviteData?.invitation_id || inviteData?.data?.id;
 
-    if (inviteId) {
-      return {
-        success: true,
-        invitation_id: inviteId,
-        provider_id: providerId,
-        public_identifier: publicIdentifier,
-        personalized_message: personalizedMessage,
-      };
+      if (inviteId) {
+        return {
+          success: true,
+          invitation_id: inviteId,
+          provider_id: providerId,
+          public_identifier: publicIdentifier,
+          personalized_message: personalizedMessage,
+        };
+      }
+
+      // 2xx but no usable ID — fall through to chat
+      console.warn(`[linkedin_message] Invite 2xx but no ID for ${publicIdentifier}, falling back to chat`);
+    } else {
+      const inviteStatus = inviteRes.status;
+      await inviteRes.text(); // consume body
+
+      if (inviteStatus !== 422 && inviteStatus !== 400) {
+        // Non-recoverable error
+        return { success: false, error: `Invite failed (${inviteStatus})` };
+      }
+      // 422 = already connected, 400 = message too long — fall through to chat
     }
-
-    // 2xx but no usable ID — fall through to chat
-    console.warn(`[linkedin_message] Invite 2xx but no ID for ${publicIdentifier}, falling back to chat`);
-  } else {
-    const inviteStatus = inviteRes.status;
-    await inviteRes.text(); // consume body
-
-    if (inviteStatus !== 422 && inviteStatus !== 400) {
-      // Non-recoverable error
-      return { success: false, error: `Invite failed (${inviteStatus})` };
-    }
-    // 422 = already connected, 400 = message too long — fall through to chat
   }
 
   // Step 5: Chat lookup fallback (max 3 pages × 20 = 60 chats)

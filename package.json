@@ -5,7 +5,9 @@
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --outdir=dist --format=cjs --packages=external",
     "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@bull-board/api": "^6.5.0",
@@ -20,6 +22,7 @@
     "@types/node": "^22.5.5",
     "esbuild": "^0.24.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.5.3"
+    "typescript": "^5.5.3",
+    "vitest": "^2.0.0"
   }
 }

@@ -13,6 +13,7 @@ import { checkConnection } from '../lib/unipile-check-connection';
 import { unipileFetch } from '../lib/unipile-fetch';
 import { engagePost } from '../lib/unipile-engage-post';
 import { BatchWriter } from '../lib/batch-db';
+import { isPhantomMessageResult, isLinkedInMessageFollowUp } from '../lib/linkedin-helpers';
 
 interface ExecutionJobData {
   execution_id: string;
@@ -579,15 +580,20 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
 
   // 8. Duplicate execution check (step_results table — secondary guard, may be missing if BatchWriter failed or step was cascade-deleted)
   if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
+    // Also treat a phantom-guard skipped result as "already handled" so a retry doesn't
+    // re-execute (and re-count) the step. The phantom guard writes 'skipped' before it
+    // advances current_step_id; if that advance write failed and the job is retried we
+    // land here with current_step_id still pointing at the skipped step.
     const { data: existingResult } = await (supabase
       .from('unipile_step_results')
-      .select('id')
+      .select('id, status')
       .eq('execution_id', execution_id)
       .eq('step_id', currentStep.id)
-      .eq('status', 'success') as any).maybeSingle();
+      .in('status', ['success', 'skipped']) as any).maybeSingle();
 
     if (existingResult) {
-      console.log(`⏭️ Duplicate: step ${currentStep.id} already succeeded, advancing`);
+      const label = existingResult.status === 'skipped' ? 'skipped (phantom guard)' : 'succeeded';
+      console.log(`⏭️ Duplicate: step ${currentStep.id} already ${label}, advancing`);
       const nextStepId = await getNextStepId(currentStep.id);
       if (nextStepId) {
         const nextExecAt = await enforceTimeWindow(new Date(), sequence);
@@ -841,13 +847,130 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
         const accountId = assignedLinkedInAccountId || cfg.account_id;
         if (!accountId) throw new Error('Missing required LinkedIn account');
 
+        const isFollowUp = isLinkedInMessageFollowUp(steps, executionLog, currentStep.id);
+
+        // Hydrate chat_id for follow-ups when it is missing from the execution row.
+        // Queries prior successful step results for this execution that captured a chat_id.
+        let chatId: string | undefined = (execution as any).chat_id || cfg.chat_id;
+        if (isFollowUp && !chatId) {
+          const { data: priorResultWithChat } = await (supabase
+            .from('unipile_step_results')
+            .select('unipile_chat_id')
+            .eq('execution_id', execution_id)
+            .eq('status', 'success')
+            .not('unipile_chat_id', 'is', null)
+            .order('executed_at', { ascending: false })
+            .limit(1) as any).maybeSingle();
+
+          if (priorResultWithChat?.unipile_chat_id) {
+            chatId = priorResultWithChat.unipile_chat_id;
+            // Persist back so subsequent steps in this execution don't re-resolve.
+            await supabase.from('unipile_sequence_executions')
+              .update({ chat_id: chatId, updated_at: new Date().toISOString() })
+              .eq('id', execution_id);
+            console.log(`🔧 [${execution_id}] Hydrated chat_id from prior step results: ${chatId}`);
+          }
+        }
+
         const result = await sendLinkedInMessage({
           account_id: accountId,
           lead,
           message: cfg.message_body || cfg.message || '',
           use_inmail: cfg.use_inmail || false,
-          chat_id: (execution as any).chat_id || cfg.chat_id,
+          chat_id: chatId,
+          // Prevent the invite endpoint from being called on follow-up steps — invites there
+          // are always phantoms (the connection already exists).
+          allowInviteFallback: !isFollowUp,
         });
+
+        // Phantom guard: invitation_id with no message_id / chat_id means the sender fell
+        // back to the LinkedIn invitation endpoint instead of sending a real message.
+        // Mark the step skipped, roll back the daily counter, and advance normally.
+        if (isPhantomMessageResult(result)) {
+          console.warn(`⚠️ [${execution_id}] Phantom message guard: got invitation_id only, skipping step`);
+
+          await stepResultWriter.add({
+            execution_id,
+            step_id: currentStep.id,
+            lead_id: (execution as any).lead_id,
+            contact_id: (execution as any).contact_id,
+            step_type: 'linkedin_message',
+            status: 'skipped',
+            error_message: null,
+            unipile_message_id: null,
+            unipile_chat_id: null,
+            executed_at: new Date().toISOString(),
+            response_data: {
+              note: 'phantom_message_guard',
+              invitation_id: result.invitation_id,
+              provider_id: result.provider_id || null,
+            },
+          });
+          await stepResultWriter.flush();
+
+          if (preIncrementedAccountId) {
+            try {
+              await supabase.rpc('rollback_daily_limit_increment', {
+                p_account_id: preIncrementedAccountId,
+                p_action_type: preIncrementedMessageType,
+                p_date: new Date().toISOString().split('T')[0],
+              });
+              console.log(`↩️ [${execution_id}] Daily limit rolled back (phantom_message_guard)`);
+            } catch (e: any) {
+              console.warn(`⚠️ Failed to rollback daily limit for ${preIncrementedAccountId}:`, e.message);
+            }
+          }
+
+          // Advance per skip semantics — same logic as the normal success advance path.
+          const skipNextStepId = await getNextStepId(currentStep.id);
+          const skipLogEntry = {
+            step_id: currentStep.id,
+            step_type: 'linkedin_message',
+            action: 'skipped',
+            reason: 'phantom_message_guard',
+            executed_at: new Date().toISOString(),
+          };
+
+          if (skipNextStepId) {
+            const skipNextStep = steps.find((s: any) => s.id === skipNextStepId);
+            let skipNextExecAt: Date = new Date();
+            if (skipNextStep?.step_type === 'delay') {
+              const dv = skipNextStep.configuration?.delay_value || skipNextStep.delay_value || 1;
+              const du = skipNextStep.configuration?.delay_unit || skipNextStep.delay_unit || 'days';
+              const rawDate = new Date(Date.now() + calculateDelay(dv, du));
+              if (du === 'days' && sequence?.scheduled_start_time) {
+                const tz = sequence.timezone || 'UTC';
+                const [sH, sM] = sequence.scheduled_start_time.split(':').map(Number);
+                const targetDayStr = rawDate.toLocaleDateString('en-CA', { timeZone: tz });
+                skipNextExecAt = convertToUTC(targetDayStr, sH, sM, tz);
+              } else {
+                skipNextExecAt = rawDate;
+              }
+            }
+            skipNextExecAt = await enforceTimeWindow(skipNextExecAt, sequence);
+
+            await supabase.from('unipile_sequence_executions')
+              .update({
+                current_step_id: skipNextStepId,
+                next_execution_at: skipNextExecAt.toISOString(),
+                execution_log: [...executionLog, skipLogEntry],
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', execution_id);
+            console.log(`➡️ [${execution_id}] Advanced past phantom step to ${skipNextStepId}`);
+          } else {
+            await supabase.from('unipile_sequence_executions')
+              .update({
+                status: 'completed',
+                execution_log: [...executionLog, skipLogEntry],
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', execution_id);
+            console.log(`✅ [${execution_id}] Execution completed after phantom step (no next step)`);
+          }
+
+          return; // exits try block → finally releases claim
+        }
 
         if (result.success) {
           stepResult = result;
