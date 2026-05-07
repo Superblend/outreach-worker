@@ -1655,10 +1655,22 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     return;
   }
 
-  // Fix 1: capture advance error and handle FK violation explicitly
-  const { error: advanceError } = await supabase.from('unipile_sequence_executions')
+  // Atomic advance with optimistic-concurrency guard.
+  // expectedStepId is the current_step_id we observed at the start of this job;
+  // if another worker (or the scheduler self-heal path) already advanced past it,
+  // .update().eq('current_step_id', expectedStepId) matches zero rows and we exit
+  // cleanly without re-sending or throwing. .is(null) handles the first-step case
+  // where current_step_id was still null in the DB.
+  const expectedStepId = (execution as any).current_step_id as string | null;
+  const advanceQueryBase = supabase.from('unipile_sequence_executions')
     .update(advanceUpdate)
     .eq('id', execution_id);
+  const advanceQuery = expectedStepId === null
+    ? advanceQueryBase.is('current_step_id', null)
+    : advanceQueryBase.eq('current_step_id', expectedStepId);
+  const { data: advanced, error: advanceError } = await advanceQuery
+    .select('id')
+    .maybeSingle();
 
   if (advanceError) {
     console.error(`❌ [${execution_id}] Advance failed: ${advanceError.message}`);
@@ -1673,8 +1685,19 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
         })
         .eq('id', execution_id);
       console.log(`✅ Execution ${execution_id} completed (advance FK violation)`);
+      return;
     }
-    // execution_log already has the completed entry — next run will advance via guard
+    // Non-FK errors: throw so BullMQ retries / scheduler self-heal pass picks it up.
+    // The step result row was already written via batchDb above, so a retry will
+    // observe Layer 4 of the pre-send guard and skip re-sending.
+    throw advanceError;
+  }
+
+  if (!advanced) {
+    // Another worker (or scheduler-recovery) already advanced this execution past
+    // expectedStepId. Exit cleanly — DO NOT re-send, DO NOT throw. The result row
+    // was already queued above; whichever worker advanced first carries the state.
+    console.log(`🪦 [stale-job] exec=${execution_id} step=${expectedStepId ?? 'null'} reason=already_advanced (atomic guard)`);
     return;
   }
 
