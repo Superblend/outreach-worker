@@ -2,7 +2,10 @@ import { connection, getAccountQueue } from './queues/definitions';
 import { createAccountWorker } from './workers/execution.worker';
 import { Worker } from 'bullmq';
 
-const RECONCILE_INTERVAL_MS = 30_000;
+// A2: Reconcile every 60s (was 30s). Binds a consumer to every queue that
+// exists in Redis regardless of current job count — delayed-only queues need a
+// consumer just as much as queues with waiting jobs.
+const RECONCILE_INTERVAL_MS = 60_000;
 // After a queue has been empty for this long, close its worker to free resources
 const WORKER_IDLE_TIMEOUT_MS = 5 * 60_000;
 
@@ -27,8 +30,7 @@ class WorkerManager {
 
   /**
    * Ensure a worker exists for the given account queue.
-   * Called directly by the scanner after each enqueue — does not depend on
-   * Redis key discovery, so it works regardless of KEYS/SCAN availability.
+   * Called directly by the scanner after each enqueue — primary mechanism.
    */
   ensureWorker(queueName: string): void {
     if (this.workers.has(queueName)) return;
@@ -47,62 +49,78 @@ class WorkerManager {
     console.log(`🔧 WorkerManager: created ${channel} worker for ${entityId} (queue=${queueName}) [via ensureWorker]`);
   }
 
-  /** Scan Redis for account queues with pending jobs; create/close workers accordingly. */
+  /**
+   * Scan Redis for all account queues; bind a consumer to each regardless of
+   * job count (A2 fix). Separately computes hasPendingJobs for the watchdog.
+   */
   async reconcile(): Promise<void> {
     console.log(`🔄 WorkerManager: reconcile starting (active workers=${this.workers.size})`);
     try {
-      const activeQueues = await this.scanActiveQueues();
-      this.hasPendingJobs = activeQueues.size > 0;
-      console.log(`🔄 WorkerManager: reconcile found ${activeQueues.size} active queue(s): ${[...activeQueues].join(', ') || '(none)'}`);
+      // A2: scan all queues that exist in Redis (not just those with pending jobs)
+      const allQueues = await this.scanAllQueueNames();
+      console.log(`🔄 WorkerManager: found ${allQueues.size} queue(s) in Redis: ${[...allQueues].slice(0, 5).join(', ')}${allQueues.size > 5 ? '…' : ''}`);
 
-      // Create workers for queues that appeared since last reconcile
-      for (const queueName of activeQueues) {
-        if (!this.workers.has(queueName)) {
-          const parsed = parseAccountQueue(queueName);
-          if (!parsed) continue;
-          const { channel, entityId } = parsed;
-          try {
-            const worker = createAccountWorker(queueName, channel, entityId, () => {
-              this.workerLastActive.set(queueName, Date.now());
-            });
-            this.workers.set(queueName, worker);
+      // Bind a consumer to every queue. Delayed-only queues need a consumer too.
+      for (const queueName of allQueues) {
+        if (this.workers.has(queueName)) continue;
+        const parsed = parseAccountQueue(queueName);
+        if (!parsed) continue;
+        const { channel, entityId } = parsed;
+        try {
+          const q = getAccountQueue(queueName);
+          const [w, d] = await Promise.allSettled([q.getWaitingCount(), q.getDelayedCount()])
+            .then(([wr, dr]) => [
+              wr.status === 'fulfilled' ? wr.value : 0,
+              dr.status === 'fulfilled' ? dr.value : 0,
+            ]);
+          console.log(`[watchdog] rebinding consumer for queue=${queueName} waiting=${w} delayed=${d} before rebind`);
+          const worker = createAccountWorker(queueName, channel, entityId, () => {
             this.workerLastActive.set(queueName, Date.now());
-            console.log(`🔧 WorkerManager: created ${channel} worker for ${entityId} (queue=${queueName})`);
-          } catch (err: any) {
-            console.error(`WorkerManager: failed to create worker for ${queueName}:`, err.message);
-          }
+          });
+          this.workers.set(queueName, worker);
+          this.workerLastActive.set(queueName, Date.now());
+          console.log(`🔧 WorkerManager: created ${channel} worker for ${entityId} (queue=${queueName})`);
+        } catch (err: any) {
+          console.error(`WorkerManager: failed to create worker for ${queueName}:`, err.message);
         }
       }
 
-      // Close workers whose queues have been empty for 5+ minutes
+      // Close workers whose queues have vanished from Redis AND been idle > 5 min.
       for (const [queueName, lastActive] of this.workerLastActive) {
-        if (activeQueues.has(queueName)) continue;
-        if (this.workers.has(queueName) && Date.now() - lastActive < WORKER_IDLE_TIMEOUT_MS) continue;
+        if (allQueues.has(queueName)) continue;
+        if (Date.now() - lastActive < WORKER_IDLE_TIMEOUT_MS) continue;
         const worker = this.workers.get(queueName);
         if (worker) {
-          try {
-            await worker.close();
-          } catch (err: any) {
-            console.warn(`WorkerManager: error closing worker for ${queueName}:`, err.message);
-          }
+          try { await worker.close(); } catch {}
           this.workers.delete(queueName);
           this.workerLastActive.delete(queueName);
           console.log(`🔧 WorkerManager: closed idle worker for ${queueName}`);
         }
       }
 
-      console.log(`🔄 WorkerManager: reconcile complete (active workers=${this.workers.size})`);
+      // Compute hasPendingJobs separately so the watchdog stays accurate
+      // even though we now bind workers to empty queues.
+      let totalPending = 0;
+      for (const queueName of this.workers.keys()) {
+        try {
+          const q = getAccountQueue(queueName);
+          const [w, a, d] = await Promise.all([q.getWaitingCount(), q.getActiveCount(), q.getDelayedCount()]);
+          totalPending += w + a + d;
+        } catch { /* ignore — queue may be transitioning */ }
+      }
+      this.hasPendingJobs = totalPending > 0;
+
+      console.log(`🔄 WorkerManager: reconcile complete (active workers=${this.workers.size} pending=${totalPending})`);
     } catch (err: any) {
       console.error('WorkerManager: reconcile top-level error:', err.stack ?? err.message);
     }
   }
 
   /**
-   * Scan Redis for outreach-linkedin-* and outreach-email-* queues that have pending jobs.
-   * Uses SCAN (cursor-based) instead of KEYS so it works on managed Redis providers
-   * (Upstash, Railway internal Redis) that disable the blocking KEYS command.
+   * Scan Redis for all outreach-linkedin-* and outreach-email-client-* queue names.
+   * Does NOT filter by job count — returns every queue that has ever been created.
    */
-  private async scanActiveQueues(): Promise<Set<string>> {
+  private async scanAllQueueNames(): Promise<Set<string>> {
     const found = new Set<string>();
     const prefixes = ['bull:outreach-linkedin-', 'bull:outreach-email-client-'];
 
@@ -110,45 +128,23 @@ class WorkerManager {
       const pattern = `${prefix}*:id`;
       let keys: string[] = [];
 
-      // Try SCAN first (non-blocking, works everywhere)
       try {
         keys = await this.scanKeys(pattern);
-        console.log(`WorkerManager: SCAN "${pattern}" → ${keys.length} key(s): ${keys.slice(0, 5).join(', ')}${keys.length > 5 ? '…' : ''}`);
+        console.log(`WorkerManager: SCAN "${pattern}" → ${keys.length} key(s)`);
       } catch (scanErr: any) {
-        console.error(`WorkerManager: SCAN failed for pattern "${pattern}":`, scanErr.message);
-        // Fall back to KEYS if SCAN is somehow unavailable
         try {
           keys = await connection.keys(pattern);
           console.log(`WorkerManager: KEYS fallback "${pattern}" → ${keys.length} key(s)`);
         } catch (keysErr: any) {
-          console.error(`WorkerManager: KEYS also failed for pattern "${pattern}":`, keysErr.message);
+          console.error(`WorkerManager: both SCAN and KEYS failed for ${prefix}:`, keysErr.message);
           continue;
         }
       }
 
       for (const key of keys) {
-        // Key format: bull:outreach-linkedin-{accountId}:id or bull:outreach-email-client-{clientId}:id
         const match = key.match(/^bull:(outreach-(?:linkedin|email-client)-.+):id$/);
-        if (!match) {
-          console.warn(`WorkerManager: unexpected key format skipped: ${key}`);
-          continue;
-        }
-        const queueName = match[1];
-        try {
-          const q = getAccountQueue(queueName);
-          const [waiting, active, delayed] = await Promise.all([
-            q.getWaitingCount(),
-            q.getActiveCount(),
-            q.getDelayedCount(),
-          ]);
-          const total = waiting + active + delayed;
-          console.log(`WorkerManager: queue ${queueName} → waiting=${waiting} active=${active} delayed=${delayed}`);
-          if (total > 0) {
-            found.add(queueName);
-          }
-        } catch (err: any) {
-          console.warn(`WorkerManager: could not check counts for ${queueName}:`, err.message);
-        }
+        if (match) found.add(match[1]);
+        else console.warn(`WorkerManager: unexpected key format skipped: ${key}`);
       }
     }
 
@@ -167,7 +163,7 @@ class WorkerManager {
     return results;
   }
 
-  /** Drain all per-account queues. Called on startup to clear stale session jobs. */
+  /** Drain all per-account queues. Called ONLY on process startup to clear stale session jobs. */
   async drainAllAccountQueues(): Promise<void> {
     let keys: string[] = [];
     for (const prefix of ['bull:outreach-linkedin-', 'bull:outreach-email-client-']) {
@@ -195,11 +191,21 @@ class WorkerManager {
     }
   }
 
-  /** Close all workers, drain their queues, then re-reconcile. Used by watchdog restart. */
+  /**
+   * Close all account workers then re-reconcile (binds fresh consumers).
+   * A1 fix: does NOT drain queues — waiting/delayed jobs are valid and must survive restart.
+   */
   async restartAll(): Promise<void> {
     console.log('🔄 WorkerManager: restarting all account workers...');
     for (const [queueName, worker] of this.workers) {
       try {
+        const q = getAccountQueue(queueName);
+        const [w, d] = await Promise.allSettled([q.getWaitingCount(), q.getDelayedCount()])
+          .then(([wr, dr]) => [
+            wr.status === 'fulfilled' ? wr.value : 0,
+            dr.status === 'fulfilled' ? dr.value : 0,
+          ]);
+        console.log(`[watchdog] rebinding consumer for queue=${queueName} waiting=${w} delayed=${d} before rebind`);
         await worker.close();
       } catch (e: any) {
         console.error(`WorkerManager: error closing ${queueName}:`, e.message);
@@ -207,7 +213,7 @@ class WorkerManager {
     }
     this.workers.clear();
     this.workerLastActive.clear();
-    await this.drainAllAccountQueues();
+    // Do NOT drain — jobs remain in queues and need a fresh consumer, not deletion.
     await this.reconcile();
     console.log('✅ WorkerManager: restart complete');
   }

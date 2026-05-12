@@ -14,6 +14,8 @@ import { unipileFetch } from '../lib/unipile-fetch';
 import { engagePost } from '../lib/unipile-engage-post';
 import { BatchWriter } from '../lib/batch-db';
 import { isPhantomMessageResult, isLinkedInMessageFollowUp } from '../lib/linkedin-helpers';
+import { withTimeout } from '../lib/with-timeout';
+import { recordJobCompletion } from '../health';
 
 interface ExecutionJobData {
   execution_id: string;
@@ -556,13 +558,16 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     }
   }
 
-  // 7. Idempotency guard: check execution_log (in-memory, survives step_results loss and cascade deletes)
+  // 7. Idempotency guard: only a confirmed 'sent' entry triggers a skip.
+  // 'started', 'error', and 'completed' entries do NOT short-circuit — they allow retry.
+  // A4 fix: was checking action === 'completed' which would skip crashed attempts that
+  // left a completed log entry for a different reason (e.g. prior step advance).
   if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
     const alreadySentInLog = executionLog.some(
-      (entry: any) => entry.step_id === currentStep.id && entry.action === 'completed'
+      (entry: any) => entry.step_id === currentStep.id && entry.action === 'sent'
     );
     if (alreadySentInLog) {
-      console.log(`⏭️ [${execution_id}] Idempotency guard: step ${currentStep.id} already completed per execution_log, advancing`);
+      console.log(`⏭️ [${execution_id}] Idempotency guard: step ${currentStep.id} already sent per execution_log, advancing`);
       const nextStepId = await getNextStepId(currentStep.id);
       if (nextStepId) {
         const nextExecAt = await enforceTimeWindow(new Date(), sequence);
@@ -797,6 +802,25 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   let stepError: string | null = null;
   let nextStepId: string | null = null;
   let executedAt: string | null = null; // captured right after API responds
+  let sentLogEntry: any = null;         // set after confirmed Unipile success; used by A4 idempotency
+
+  // 10b. Write 'started' to execution_log (diagnostic, fire-and-forget).
+  // Lets the self-heal cron distinguish "attempt in progress" from "never started".
+  // Non-blocking — a failed write here must not block the send.
+  if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
+    const _startedEntry = {
+      action: 'started',
+      step_id: currentStep.id,
+      ts: new Date().toISOString(),
+      attempt: (job.attemptsMade ?? 0) + 1,
+    };
+    (async () => {
+      const { error } = await supabase.from('unipile_sequence_executions')
+        .update({ execution_log: [...executionLog, _startedEntry], updated_at: new Date().toISOString() })
+        .eq('id', execution_id);
+      if (error) console.warn(`⚠️ [${execution_id}] 'started' log write failed: ${error.message}`);
+    })().catch(() => {});
+  }
 
   try {
     switch (currentStep.step_type) {
@@ -1483,6 +1507,26 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     await stepResultWriter.flush();
   }
 
+  // 12b. Write 'sent' to execution_log immediately after confirmed step_result flush.
+  // This is the primary idempotency anchor (A4): if the process dies before step 16,
+  // the retry finds 'sent' and skips the Unipile call without re-sending.
+  // step_results (step 8 secondary guard) covers the case where this write also fails.
+  if (stepSuccess && SENDING_STEP_TYPES.includes(currentStep.step_type)) {
+    sentLogEntry = {
+      action: 'sent',
+      step_id: currentStep.id,
+      ts: executedAt || new Date().toISOString(),
+      message_id: stepResult?.message_id || stepResult?.invitation_id || null,
+    };
+    const { error: sentLogError } = await supabase.from('unipile_sequence_executions')
+      .update({ execution_log: [...executionLog, sentLogEntry], updated_at: new Date().toISOString() })
+      .eq('id', execution_id);
+    if (sentLogError) {
+      console.warn(`⚠️ [${execution_id}] 'sent' log write failed — step_results secondary guard still active: ${sentLogError.message}`);
+      sentLogEntry = null; // don't include in advance log if write failed
+    }
+  }
+
   // 13. Rollback daily limit on failure
   if (!stepSuccess && preIncrementedAccountId) {
     try {
@@ -1591,7 +1635,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     await supabase.from('unipile_sequence_executions')
       .update({
         status: 'completed',
-        execution_log: [...executionLog, logEntry],
+        execution_log: [...executionLog, ...(sentLogEntry ? [sentLogEntry] : []), logEntry],
         updated_at: new Date().toISOString(),
       })
       .eq('id', execution_id);
@@ -1634,7 +1678,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     await supabase.from('unipile_sequence_executions')
       .update({
         status: 'completed',
-        execution_log: [...executionLog, logEntry],
+        execution_log: [...executionLog, ...(sentLogEntry ? [sentLogEntry] : []), logEntry],
         updated_at: new Date().toISOString(),
       })
       .eq('id', execution_id);
@@ -1649,7 +1693,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   // advance leaves execution_log without the completed entry and both guards fail.
   const { error: logError } = await supabase.from('unipile_sequence_executions')
     .update({
-      execution_log: [...executionLog, logEntry],
+      execution_log: [...executionLog, ...(sentLogEntry ? [sentLogEntry] : []), logEntry],
       updated_at: new Date().toISOString(),
     })
     .eq('id', execution_id);
@@ -1909,7 +1953,7 @@ export function createAccountWorker(
   });
 
   worker.on('completed', (job) => {
-    workerHealth.lastJobCompletedAt = new Date();
+    recordJobCompletion();
     onJobComplete();
     console.log(`✅ [queue=${queueName}] job=${job.id} completed`);
   });
@@ -2019,7 +2063,7 @@ export function startExecutionWorker() {
   });
 
   worker.on('completed', (job) => {
-    workerHealth.lastJobCompletedAt = new Date();
+    recordJobCompletion();
     console.log(`✅ [queue=outreach-executions] job=${job.id} completed`);
   });
 
