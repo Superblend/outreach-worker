@@ -33,14 +33,15 @@ function cohortPriority(
   nextExecutionAt: string,
   now: number = Date.now()
 ): number {
-  if (cohort === 'new_today') return firstTouchDone ? 2 : 1;
   if (cohort === 'in_flight') {
     const overdueMs = now - new Date(nextExecutionAt).getTime();
-    if (overdueMs > 86_400_000) return 3; // P3.a overdue >24h
-    if (overdueMs > 3_600_000)  return 4; // P3.b overdue 1–24h
-    return 5;                              // P3.c on-time / future
+    if (overdueMs > 86_400_000) return 1;  // overdue >24h: most urgent
+    if (overdueMs > 3_600_000)  return 2;  // overdue 1–24h
+    if (overdueMs > 900_000)    return 3;  // overdue 15m–1h
+    return 6;                               // on-time: below new_today
   }
-  return 6; // low_priority / null
+  if (cohort === 'new_today') return firstTouchDone ? 5 : 4;
+  return 7; // low_priority / null
 }
 
 async function scanAndEnqueue() {
@@ -51,20 +52,47 @@ async function scanAndEnqueue() {
 
   // ========================================
   // SCAN DUE EXECUTIONS (use_bullmq=true only)
+  // Two-pass approach: overdue in_flight rows are fetched first so they
+  // are always enqueued regardless of how many new-campaign executions exist.
+  // The partial index idx_executions_overdue_inflight (deployed by Lovable)
+  // makes Pass 1 a fast index scan.
   // ========================================
-  const { data: dueExecutions, error: execError } = await supabase
+  const EXECUTION_SELECT = `
+    id, batch_number, next_execution_at, updated_at,
+    unipile_sequence_id, current_step_id,
+    assigned_linkedin_account_id, assigned_email_account_id,
+    priority_cohort, first_touch_done,
+    unipile_sequences!inner(
+      status, scheduled_start_time, scheduled_end_time,
+      timezone, active_days, client_id, use_bullmq, worker_partition
+    ),
+    unipile_sequence_steps!unipile_sequence_executions_current_step_id_fkey(step_type)
+  `;
+
+  // Pass 1 — overdue in_flight (next_execution_at ≥ 15 min ago)
+  const fifteenMinAgo = new Date(now.getTime() - 15 * 60_000).toISOString();
+  const pass1Limit = Math.floor(config.scanLimit * 0.4); // up to 40% of budget
+  const { data: overdueRows, error: overdueErr } = await supabase
     .from('unipile_sequence_executions')
-    .select(`
-      id, batch_number, next_execution_at, updated_at,
-      unipile_sequence_id, current_step_id,
-      assigned_linkedin_account_id, assigned_email_account_id,
-      priority_cohort, first_touch_done,
-      unipile_sequences!inner(
-        status, scheduled_start_time, scheduled_end_time,
-        timezone, active_days, client_id, use_bullmq, worker_partition
-      ),
-      unipile_sequence_steps!unipile_sequence_executions_current_step_id_fkey(step_type)
-    `)
+    .select(EXECUTION_SELECT)
+    .eq('status', 'running')
+    .eq('execution_state', 'not_started')
+    .eq('priority_cohort', 'in_flight')
+    .eq('unipile_sequences.status', 'active')
+    .eq('unipile_sequences.use_bullmq', true)
+    .lte('next_execution_at', fifteenMinAgo)
+    .lt('updated_at', updatedAtBuffer)
+    .order('next_execution_at', { ascending: true })
+    .limit(pass1Limit);
+
+  if (overdueErr) console.error('Scanner: overdue pass failed:', overdueErr.message);
+
+  // Pass 2 — all due now (remaining budget, deduped against Pass 1)
+  const seenIds = new Set((overdueRows || []).map((e: any) => e.id));
+  const pass2Limit = config.scanLimit - (overdueRows?.length || 0);
+  const { data: generalRows, error: generalErr } = await supabase
+    .from('unipile_sequence_executions')
+    .select(EXECUTION_SELECT)
     .eq('status', 'running')
     .eq('execution_state', 'not_started')
     .eq('unipile_sequences.status', 'active')
@@ -73,14 +101,19 @@ async function scanAndEnqueue() {
     .lt('updated_at', updatedAtBuffer)
     .order('batch_number', { ascending: true, nullsFirst: true })
     .order('next_execution_at', { ascending: true })
-    .limit(config.scanLimit);
+    .limit(pass2Limit);
 
-  if (execError) {
-    console.error('Scanner: failed to fetch executions:', execError);
-    return;
-  }
+  if (generalErr) console.error('Scanner: general pass failed:', generalErr.message);
 
-  console.log(`Scanner: found ${dueExecutions?.length || 0} due executions`);
+  const dueExecutions = [
+    ...(overdueRows || []),
+    ...(generalRows || []).filter((e: any) => !seenIds.has(e.id)),
+  ];
+
+  console.log(
+    `Scanner: found ${dueExecutions.length} due executions ` +
+    `(overdue in_flight=${overdueRows?.length || 0}, general=${(generalRows || []).filter((e: any) => !seenIds.has(e.id)).length})`
+  );
 
   if (dueExecutions && dueExecutions.length > 0) {
     // Filter by time window and active days, reschedule invalid ones

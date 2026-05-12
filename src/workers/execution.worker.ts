@@ -209,6 +209,10 @@ async function enforceTimeWindow(proposedTime: Date, sequence: any): Promise<Dat
 
   if (curMin >= startMin && curMin <= endMin) return proposedTime;
 
+  // Within 15 min past window end: allow the send rather than deferring to next day.
+  // Prevents queue-backlog delays from bumping a whole day's sends to tomorrow.
+  if (curMin > endMin && curMin <= endMin + 15) return proposedTime;
+
   // Use local date (not UTC date) so a timezone offset doesn't push us to the wrong calendar day
   const targetDate = curMin > endMin
     ? new Date(proposedTime.getTime() + 86_400_000)  // past end → next local day

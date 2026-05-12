@@ -124,6 +124,24 @@ async function initialize(): Promise<void> {
   // 2. Reset all in_progress executions — they belong to the dead previous
   //    instance and will never complete without a reset.
   await resetInProgressOrphans();
+
+  // 3. Sanity check: confirm priority_cohort backfill has been deployed.
+  //    If count is 0, cohort-based prioritization is a no-op (no in_flight rows
+  //    exist yet). This is normal before Lovable's backfill runs; the log line
+  //    lets us confirm both sides are deployed and cohorts are populated.
+  try {
+    const { count: inFlightCount } = await supabase
+      .from('unipile_sequence_executions')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'running')
+      .eq('priority_cohort', 'in_flight');
+    const suffix = (inFlightCount ?? 0) === 0
+      ? ' — backfill not yet deployed, cohort prioritization is a no-op'
+      : '';
+    console.log(`📊 Startup: priority_cohort=in_flight running executions: ${inFlightCount ?? 0}${suffix}`);
+  } catch (e: any) {
+    console.warn('⚠️ Startup: could not query in_flight cohort count:', e.message);
+  }
   // ─────────────────────────────────────────────────────────────────────
 
   // Start workers
