@@ -230,9 +230,22 @@ async function main() {
     console.error('💥 Unhandled rejection:', reason instanceof Error ? reason.stack : reason);
   });
 
-  // Graceful shutdown: write final heartbeat so Lovable dashboard shows offline state.
+  // Graceful shutdown: drain in-flight jobs, then write final heartbeat.
+  // Railway sends SIGTERM then waits 30s before SIGKILL; we budget 25s for worker close.
   process.on('SIGTERM', async () => {
-    console.log('📴 SIGTERM received — writing final heartbeat and shutting down');
+    console.log('📴 SIGTERM received — closing workers and shutting down');
+    const GRACEFUL_TIMEOUT_MS = 25_000;
+    const deadline = new Promise<void>((resolve) => setTimeout(resolve, GRACEFUL_TIMEOUT_MS));
+    const graceful = (async () => {
+      // Close the shared execution worker first (handles delay/conditional steps).
+      if (workerHealth.worker) {
+        try { await workerHealth.worker.close(); } catch { /* ignore */ }
+      }
+      // Close all per-account workers so BullMQ marks their active jobs as stalled
+      // rather than leaving them permanently locked.
+      await workerManager.closeAll().catch(() => {});
+    })();
+    await Promise.race([graceful, deadline]);
     await writeHeartbeat({ redis_connected: false, meta: { shutdown_reason: 'SIGTERM', session: SESSION_ID } }).catch(() => {});
     process.exit(0);
   });
