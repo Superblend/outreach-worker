@@ -231,11 +231,18 @@ async function main() {
   });
 
   // Graceful shutdown: drain in-flight jobs, then write final heartbeat.
-  // Railway sends SIGTERM then waits 30s before SIGKILL; we budget 25s for worker close.
+  // Railway sends SIGTERM then waits 30s before SIGKILL.
+  // Hard kill-timer at 28s guarantees we exit before SIGKILL regardless of what hangs.
+  // Worker-close budget is 20s, leaving ~8s for the heartbeat write within the 28s ceiling.
   process.on('SIGTERM', async () => {
     console.log('📴 SIGTERM received — closing workers and shutting down');
-    const GRACEFUL_TIMEOUT_MS = 25_000;
-    const deadline = new Promise<void>((resolve) => setTimeout(resolve, GRACEFUL_TIMEOUT_MS));
+    const killTimer = setTimeout(() => {
+      console.error('⚠️ SIGTERM: graceful shutdown exceeded 28s deadline — forcing exit');
+      process.exit(1);
+    }, 28_000);
+    killTimer.unref();
+
+    const closeBudget = new Promise<void>((resolve) => setTimeout(resolve, 20_000));
     const graceful = (async () => {
       // Close the shared execution worker first (handles delay/conditional steps).
       if (workerHealth.worker) {
@@ -245,8 +252,9 @@ async function main() {
       // rather than leaving them permanently locked.
       await workerManager.closeAll().catch(() => {});
     })();
-    await Promise.race([graceful, deadline]);
+    await Promise.race([graceful, closeBudget]);
     await writeHeartbeat({ redis_connected: false, meta: { shutdown_reason: 'SIGTERM', session: SESSION_ID } }).catch(() => {});
+    clearTimeout(killTimer);
     process.exit(0);
   });
 

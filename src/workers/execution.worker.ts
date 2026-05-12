@@ -16,6 +16,7 @@ import { BatchWriter } from '../lib/batch-db';
 import { isPhantomMessageResult, isLinkedInMessageFollowUp } from '../lib/linkedin-helpers';
 import { withTimeout } from '../lib/with-timeout';
 import { recordJobCompletion } from '../health';
+import { findSentLogEntry } from '../lib/idempotency-helpers';
 
 interface ExecutionJobData {
   execution_id: string;
@@ -46,11 +47,6 @@ const LINKEDIN_STEP_TYPES = [
 ];
 
 const SENDING_STEP_TYPES = ['linkedin_invitation', 'linkedin_message', 'email'];
-
-// Dual-read cutoff: executions processed before A4 deploy wrote action:'completed' as the
-// idempotency anchor. Treat those legacy entries as 'sent' so they still block replay.
-// Remove this constant (and the OR branch in Step 7) after 2026-06-12.
-const LEGACY_LOG_CUTOFF = '2026-05-12T15:00:00.000Z';
 
 const LINKEDIN_PACING_MIN_MS = 45_000;
 const LINKEDIN_PACING_MAX_MS = 90_000;
@@ -568,14 +564,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   // A4 fix: was checking action === 'completed' which would skip crashed attempts that
   // left a completed log entry for a different reason (e.g. prior step advance).
   if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
-    const sentEntry = executionLog.find(
-      (entry: any) => entry.step_id === currentStep.id && (
-        entry.action === 'sent' ||
-        // Dual-read: legacy executions (pre-A4 deploy) used action:'completed' as the anchor.
-        // Treat them as 'sent' so re-enqueued executions don't produce duplicate sends.
-        (entry.action === 'completed' && (entry.executed_at || entry.ts || '') < LEGACY_LOG_CUTOFF)
-      )
-    );
+    const sentEntry = findSentLogEntry(executionLog, currentStep.id);
     const alreadySentInLog = !!sentEntry;
     if (alreadySentInLog) {
       const label = sentEntry.action === 'sent' ? 'already sent' : 'already sent (legacy completed entry)';
