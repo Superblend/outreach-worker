@@ -31,7 +31,7 @@ import {
 const mockUnipileFetch = vi.fn();
 const mockSupabaseFrom = vi.fn();
 
-vi.mock('../supabase', () => ({
+vi.mock('../../supabase', () => ({
   supabase: {
     from: (...args: any[]) => mockSupabaseFrom(...args),
     rpc: vi.fn().mockResolvedValue({ data: null, error: null }),
@@ -39,22 +39,22 @@ vi.mock('../supabase', () => ({
   invokeEdgeFunction: vi.fn().mockResolvedValue({ data: null, error: null }),
 }));
 
-vi.mock('../config', () => ({
+vi.mock('../../config', () => ({
   config: {
     unipile: { apiUrl: 'https://api.unipile.test', apiKey: 'test-key' },
     supabase: { url: 'https://test.supabase.co', anonKey: 'test-anon' },
   },
 }));
 
-vi.mock('../lib/unipile-fetch', () => ({
+vi.mock('../unipile-fetch', () => ({
   unipileFetch: (...args: any[]) => mockUnipileFetch(...args),
 }));
 
-vi.mock('../lib/variable-replace', () => ({
+vi.mock('../variable-replace', () => ({
   normalizeAndReplace: (msg: string) => msg,
 }));
 
-import { sendLinkedInMessage } from '../lib/unipile-send-linkedin-message';
+import { sendLinkedInMessage } from '../unipile-send-linkedin-message';
 
 // ---------------------------------------------------------------------------
 // Helpers
