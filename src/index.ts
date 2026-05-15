@@ -5,40 +5,9 @@ import { startExecutionWorker } from './workers/execution.worker';
 import { startBatchWorker } from './workers/batch.worker';
 import { setupBullBoard } from './monitoring/bull-board';
 import { connection, executionQueue } from './queues/definitions';
-import { workerHealth, getLastMinuteJobCount } from './health';
+import { workerHealth } from './health';
 import { supabase } from './supabase';
 import { workerManager } from './worker-manager';
-import { withTimeout } from './lib/with-timeout';
-
-const WORKER_ID = `${process.env.HOSTNAME || 'worker'}-${process.env.WORKER_PARTITION || '0'}`;
-
-async function writeHeartbeat(extra: Record<string, any> = {}): Promise<void> {
-  try {
-    await withTimeout(
-      supabase.from('worker_heartbeats').upsert(
-        {
-          worker_id: WORKER_ID,
-          partition: parseInt(process.env.WORKER_PARTITION || '0', 10),
-          last_heartbeat_at: new Date().toISOString(),
-          jobs_completed_total: workerHealth.jobsCompletedTotal,
-          jobs_completed_last_minute: getLastMinuteJobCount(),
-          active_queues: workerManager.getActiveWorkerCount(),
-          redis_connected: connection.status === 'ready',
-          meta: {
-            session: SESSION_ID,
-            uptime: Math.round(process.uptime()),
-          },
-          ...extra,
-        },
-        { onConflict: 'worker_id' },
-      ),
-      10_000,
-      'supabase:heartbeat',
-    );
-  } catch (e: any) {
-    console.warn(`⚠️ [heartbeat] write failed (non-fatal):`, e.message);
-  }
-}
 
 // Watchdog fires every 15s; triggers restart after 60s with no completed job + pending work.
 const WORKER_STALE_MS = 60_000;
@@ -110,15 +79,13 @@ async function runWatchdog() {
     workerHealth.workerRestarting = true;
     try {
       if (workerHealth.worker) {
-        // A1: close without draining — waiting/delayed jobs must survive the restart
         await workerHealth.worker.close();
         workerHealth.worker = null;
       }
-      // A1: do NOT drain — drainExecutionQueue() deletes pending jobs whose DB rows
-      // remain in running forever. Only drain on fresh process startup (initialize).
+      await drainExecutionQueue();
       workerHealth.lastJobCompletedAt = null;
       startExecutionWorker();
-      await workerManager.restartAll(); // closes + rebinds consumers, no drain
+      await workerManager.restartAll();
       console.log('✅ Worker consumer restarted by watchdog');
       // Kick off an immediate scan so fresh jobs are enqueued with the current SESSION_ID
       setTimeout(() => triggerImmediateScan().catch(console.error), 500);
@@ -214,11 +181,6 @@ async function initialize(): Promise<void> {
 
   initialized = true;
   console.log('✅ Initialization complete');
-
-  // Write initial heartbeat row so Lovable dashboard sees this replica immediately.
-  await writeHeartbeat();
-  // Heartbeat every 30s — Lovable marks a replica unhealthy after 2 min silence.
-  setInterval(() => writeHeartbeat().catch(() => {}), 30_000);
 }
 
 async function main() {
@@ -228,13 +190,6 @@ async function main() {
   });
   process.on('unhandledRejection', (reason) => {
     console.error('💥 Unhandled rejection:', reason instanceof Error ? reason.stack : reason);
-  });
-
-  // Graceful shutdown: write final heartbeat so Lovable dashboard shows offline state.
-  process.on('SIGTERM', async () => {
-    console.log('📴 SIGTERM received — writing final heartbeat and shutting down');
-    await writeHeartbeat({ redis_connected: false, meta: { shutdown_reason: 'SIGTERM', session: SESSION_ID } }).catch(() => {});
-    process.exit(0);
   });
 
   // ── HTTP server starts FIRST so Railway healthchecks pass immediately ──
