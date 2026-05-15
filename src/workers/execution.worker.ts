@@ -47,11 +47,6 @@ const LINKEDIN_STEP_TYPES = [
 
 const SENDING_STEP_TYPES = ['linkedin_invitation', 'linkedin_message', 'email'];
 
-// Dual-read cutoff: executions processed before A4 deploy wrote action:'completed' as the
-// idempotency anchor. Treat those legacy entries as 'sent' so they still block replay.
-// Remove this constant (and the OR branch in Step 7) after 2026-06-12.
-const LEGACY_LOG_CUTOFF = '2026-05-12T15:00:00.000Z';
-
 const LINKEDIN_PACING_MIN_MS = 45_000;
 const LINKEDIN_PACING_MAX_MS = 90_000;
 const LINKEDIN_PACING_TTL_S = 300; // safety TTL: 5 min
@@ -568,18 +563,11 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   // A4 fix: was checking action === 'completed' which would skip crashed attempts that
   // left a completed log entry for a different reason (e.g. prior step advance).
   if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
-    const sentEntry = executionLog.find(
-      (entry: any) => entry.step_id === currentStep.id && (
-        entry.action === 'sent' ||
-        // Dual-read: legacy executions (pre-A4 deploy) used action:'completed' as the anchor.
-        // Treat them as 'sent' so re-enqueued executions don't produce duplicate sends.
-        (entry.action === 'completed' && (entry.executed_at || entry.ts || '') < LEGACY_LOG_CUTOFF)
-      )
+    const alreadySentInLog = executionLog.some(
+      (entry: any) => entry.step_id === currentStep.id && entry.action === 'sent'
     );
-    const alreadySentInLog = !!sentEntry;
     if (alreadySentInLog) {
-      const label = sentEntry.action === 'sent' ? 'already sent' : 'already sent (legacy completed entry)';
-      console.log(`⏭️ [${execution_id}] Idempotency guard: step ${currentStep.id} ${label} per execution_log, advancing`);
+      console.log(`⏭️ [${execution_id}] Idempotency guard: step ${currentStep.id} already sent per execution_log, advancing`);
       const nextStepId = await getNextStepId(currentStep.id);
       if (nextStepId) {
         const nextExecAt = await enforceTimeWindow(new Date(), sequence);

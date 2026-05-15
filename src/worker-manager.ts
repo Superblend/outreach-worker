@@ -240,21 +240,6 @@ class WorkerManager {
     return stats;
   }
 
-  /**
-   * Graceful shutdown: stop reconcile, then close all account workers.
-   * Awaits each close so in-flight jobs can complete before the process exits.
-   */
-  async closeAll(): Promise<void> {
-    if (this.reconcileTimer) clearInterval(this.reconcileTimer);
-    console.log(`📴 WorkerManager: closing ${this.workers.size} account worker(s)...`);
-    await Promise.allSettled(
-      [...this.workers.values()].map((w) => w.close()),
-    );
-    this.workers.clear();
-    this.workerLastActive.clear();
-    console.log('✅ WorkerManager: all account workers closed');
-  }
-
   stop(): void {
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
   }
