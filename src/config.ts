@@ -22,6 +22,12 @@ export const config = {
   },
   port: parseInt(process.env.PORT || '3000', 10),
 
+  // When true, any non-GET Unipile request is short-circuited to a fake success
+  // response. Reads still hit Unipile so connection checks and profile lookups
+  // work normally; only side-effecting calls (invites, messages, emails, etc.)
+  // are blocked. Used in staging during orchestrator shadow + canary phases.
+  dryRun: process.env.DRY_RUN === 'true',
+
   // Scanning interval (ms)
   scanIntervalMs: 15_000,
 
