@@ -465,7 +465,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
                   executed_at: new Date().toISOString(),
                   result: { connected: true, chat_id: connResult.chat_id },
                 }],
-                unipile_chat_id: connResult.chat_id || (execution as any).unipile_chat_id,
+                chat_id: connResult.chat_id || (execution as any).chat_id,
                 updated_at: new Date().toISOString(),
               })
               .eq('id', execution_id);
@@ -855,7 +855,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
 
         // Hydrate chat_id for follow-ups when it is missing from the execution row.
         // Queries prior successful step results for this execution that captured a chat_id.
-        let chatId: string | undefined = (execution as any).unipile_chat_id || cfg.chat_id;
+        let chatId: string | undefined = (execution as any).chat_id || cfg.chat_id;
         if (isFollowUp && !chatId) {
           const { data: priorResultWithChat } = await (supabase
             .from('unipile_step_results')
@@ -870,9 +870,9 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
             chatId = priorResultWithChat.unipile_chat_id;
             // Persist back so subsequent steps in this execution don't re-resolve.
             await supabase.from('unipile_sequence_executions')
-              .update({ unipile_chat_id: chatId, updated_at: new Date().toISOString() })
+              .update({ chat_id: chatId, updated_at: new Date().toISOString() })
               .eq('id', execution_id);
-            console.log(`🔧 [${execution_id}] Hydrated unipile_chat_id from prior step results: ${chatId}`);
+            console.log(`🔧 [${execution_id}] Hydrated chat_id from prior step results: ${chatId}`);
           }
         }
 
@@ -1272,7 +1272,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
               current_step_id: condEdge.target_step_id,
               next_execution_at: nextExecAt.toISOString(),
               execution_log: [...executionLog, condLogEntry],
-              unipile_chat_id: chatId || (execution as any).unipile_chat_id,
+              chat_id: chatId || (execution as any).chat_id,
               updated_at: new Date().toISOString(),
             })
             .eq('id', execution_id);
@@ -1310,7 +1310,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
           lead,
           message: cfg.voice_note_text || cfg.message_body || '',
           use_inmail: false,
-          chat_id: (execution as any).unipile_chat_id,
+          chat_id: (execution as any).chat_id,
         });
         stepResult = result;
         if (!result.success) stepError = result.error || 'Voice note failed';
@@ -1520,10 +1520,10 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     });
   }
 
-  // 15. Update unipile_chat_id on execution if available
-  if (stepResult?.chat_id && stepResult.chat_id !== (execution as any).unipile_chat_id) {
+  // 15. Update chat_id on execution if available
+  if (stepResult?.chat_id && stepResult.chat_id !== (execution as any).chat_id) {
     await supabase.from('unipile_sequence_executions')
-      .update({ unipile_chat_id: stepResult.chat_id })
+      .update({ chat_id: stepResult.chat_id })
       .eq('id', execution_id);
   }
 
@@ -1625,7 +1625,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     updated_at: new Date().toISOString(),
   };
 
-  if (stepResult?.chat_id) advanceUpdate.unipile_chat_id = stepResult.chat_id;
+  if (stepResult?.chat_id) advanceUpdate.chat_id = stepResult.chat_id;
 
   // Fix 3: verify next step exists before advancing (guards against phantom step IDs from sequence rebuilds)
   const nextStepExists = steps.some((s: any) => s.id === nextStepId);
