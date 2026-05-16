@@ -473,9 +473,19 @@ async function enqueueExecution(
         removeOnFail: { age: 86400, count: 5000 },
       },
     );
+    // Post-enqueue diagnostic — confirms BullMQ actually accepted the job
+    // from the orchestrator's perspective. If counts.waiting > 0 here but the
+    // worker reports 0, we have a cross-service Redis visibility issue.
+    let counts: { waiting?: number; active?: number; delayed?: number; completed?: number; failed?: number } = {};
+    try {
+      counts = await targetQueue.getJobCounts('waiting', 'active', 'delayed', 'completed', 'failed');
+    } catch (countErr) {
+      console.warn(`[orchestrator] getJobCounts failed: ${countErr instanceof Error ? countErr.message : String(countErr)}`);
+    }
     console.log(
       `[orchestrator] enqueued exec=${decision.executionId} ` +
-        `queue=${targetQueueName} jobId=${jobId} priority=${decision.cohortPriority}`,
+        `queue=${targetQueueName} jobId=${jobId} priority=${decision.cohortPriority} ` +
+        `counts=${JSON.stringify(counts)}`,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
