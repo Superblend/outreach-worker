@@ -40,8 +40,12 @@ import type {
 /** Max executions considered per wake event. Per-sequence, so small budget. */
 const MAX_CANDIDATES_PER_WAKE = 500;
 
-/** Mirrors scanner.ts's updatedAtBuffer — race guard against concurrent workers. */
-const UPDATED_AT_BUFFER_MS = 30_000;
+// Note: orchestrator does NOT use scanner.ts's 30-second updated_at buffer.
+// That buffer protects scanner from cadence-based double-enqueue (15s loop).
+// The orchestrator runs reactively via Realtime / poll fallback, so the same
+// risk doesn't apply. When orchestrator-mode enqueue lands, BullMQ jobId
+// dedupe (jobId = exec_id + step_id + session_id) catches any cross-process
+// races between scanner and orchestrator during canary.
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -254,11 +258,13 @@ async function loadSequence(sequenceId: string): Promise<SequenceMeta | null> {
  * Filters:
  *   - status='running' AND execution_state='not_started' (matches scanner.ts)
  *   - next_execution_at <= now (due now or overdue)
- *   - updated_at < now - 30s (race guard against concurrent workers / passes)
+ *
+ * No updated_at race guard (see note at the top of this file). When
+ * orchestrator-mode enqueue lands, BullMQ jobId dedupe protects against
+ * any cross-process race with scanner.ts.
  */
 async function fetchDueExecutions(sequenceId: string): Promise<ExecutionCandidate[]> {
   const nowIso = new Date().toISOString();
-  const updatedAtBuffer = new Date(Date.now() - UPDATED_AT_BUFFER_MS).toISOString();
 
   const { data, error } = await supabase
     .from('unipile_sequence_executions')
@@ -270,7 +276,6 @@ async function fetchDueExecutions(sequenceId: string): Promise<ExecutionCandidat
     .eq('status', 'running')
     .eq('execution_state', 'not_started')
     .lte('next_execution_at', nowIso)
-    .lt('updated_at', updatedAtBuffer)
     .order('batch_number', { ascending: true, nullsFirst: true })
     .order('next_execution_at', { ascending: true })
     .limit(MAX_CANDIDATES_PER_WAKE);
