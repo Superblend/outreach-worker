@@ -349,6 +349,8 @@ async function scanAndEnqueue() {
 
   // ========================================
   // SCAN DUE BATCHES (use_bullmq=true only)
+  // Skip orchestrator-mode clients — orchestrator triggers
+  // `unipile-process-batch-queue` on-demand for those.
   // ========================================
   const { data: dueBatches, error: batchError } = await supabase
     .from('unipile_batch_queue')
@@ -365,10 +367,12 @@ async function scanAndEnqueue() {
     return;
   }
 
-  if (dueBatches && dueBatches.length > 0) {
+  const filteredDueBatches = filterByOrchMode(dueBatches || []);
+
+  if (filteredDueBatches.length > 0) {
     // Group by client_id
     const clientIds = [...new Set(
-      dueBatches.map((b: any) => b.unipile_sequences?.client_id).filter(Boolean)
+      filteredDueBatches.map((b: any) => b.unipile_sequences?.client_id).filter(Boolean)
     )];
 
     for (const clientId of clientIds) {
