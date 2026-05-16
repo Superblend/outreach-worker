@@ -158,13 +158,27 @@ export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<voi
       continue;
     }
 
-    // Same-day chain (P2): contact already has a slot today → free continuation.
-    let consumesSlot: boolean;
-    try {
-      consumesSlot = !(await hasSlot(seq.id, subjectId, localDate));
-    } catch {
-      // Slot read failed — fail closed by skipping this candidate this pass.
-      continue;
+    // Slot semantics: daily_batch_size caps FRESH lead starts per day only.
+    // Multi-day follow-ups (P3) and same-day chain continuations (P2) are
+    // leads-already-in-motion; they don't count against the daily quota
+    // (per-account daily caps still bound total sends — that's the worker's
+    // RPC, separate concern).
+    //
+    //   First touch          → P1 → claim slot
+    //   Same-day continuation → P2 → first_touch_done already true, free
+    //   Multi-day follow-up   → P3 → first_touch_done already true, free
+    //
+    // `hasSlot` still acts as the race guard for concurrent first-touch
+    // wakes on the same contact.
+    const isFirstTouch = !exec.first_touch_done;
+    let consumesSlot = false;
+    if (isFirstTouch) {
+      try {
+        consumesSlot = !(await hasSlot(seq.id, subjectId, localDate));
+      } catch {
+        // Slot read failed — fail closed by skipping this candidate this pass.
+        continue;
+      }
     }
 
     if (consumesSlot && slotsAvailable <= 0) {
