@@ -397,14 +397,20 @@ async function emitDecision(
  *   - Anything else → shared queue      `outreach-executions`
  *
  * jobId = `exec-{exec_id}-{step_id}-{orch_session}`
- *   - Stable within a session → BullMQ dedupes if scanner also tries to enqueue
- *     the same execution+step under the SAME session (only matters once the
- *     scanner skip filter is in place; this is the safe default).
+ *   - Stable within a session → BullMQ dedupes when the orchestrator
+ *     re-emits a decision for the same (exec, step) on subsequent wakes.
+ *     Without this, every Realtime event re-enqueues even though the worker
+ *     already has the job in flight.
  *   - Session suffix rotates on restart → old failed/stale jobs from a prior
  *     orchestrator process don't block new enqueues.
  *
- * After enqueue, we touch updated_at to push the row past scanner's 30s race
- * guard so scanner skips it during canary windows.
+ * We do NOT touch updated_at after enqueue. Scanner already skips
+ * orchestrator-mode clients at the client_id level, so the row-level
+ * race-guard touch is unnecessary. Touching here previously caused a
+ * self-triggered loop: touch fires Realtime UPDATE → orchestrator wakes →
+ * re-enqueues → touches again → ... BullMQ jobId dedupe absorbs the loop
+ * at the queue level but it spams the event bus and starves other
+ * sequences from getting CPU time.
  */
 async function enqueueExecution(
   decision: OrchDecision,
@@ -471,12 +477,6 @@ async function enqueueExecution(
       `[orchestrator] enqueued exec=${decision.executionId} ` +
         `queue=${targetQueueName} jobId=${jobId} priority=${decision.cohortPriority}`,
     );
-
-    // Touch updated_at so the scanner's 30s race guard skips this row.
-    await supabase
-      .from('unipile_sequence_executions')
-      .update({ updated_at: new Date().toISOString() })
-      .eq('id', decision.executionId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
