@@ -30,19 +30,21 @@ export async function countSlotsForDate(
   sequenceId: string,
   localDate: string,
 ): Promise<number> {
-  const { count, error } = await supabase
+  // Fetch contact_ids and count locally. Row volume per (sequence, date)
+  // is bounded by daily_batch_size (small), so this is cheap.
+  const { data, error } = await supabase
     .from('unipile_sequence_daily_leads')
-    .select('lead_id', { count: 'exact', head: true })
+    .select('contact_id')
     .eq('unipile_sequence_id', sequenceId)
     .eq('date', localDate);
 
   if (error) {
     // Fail open is dangerous here — we'd over-schedule. Fail closed: assume
     // slots are saturated and skip this pass. Next wake-up retries.
-    console.error(`[slot] count failed for sequence=${sequenceId} date=${localDate}:`, error.message);
-    throw new Error(`slot count query failed: ${error.message}`);
+    console.error(`[slot] count failed for sequence=${sequenceId} date=${localDate}:`, JSON.stringify(error));
+    throw new Error(`slot count query failed: ${JSON.stringify(error)}`);
   }
-  return count ?? 0;
+  return data?.length ?? 0;
 }
 
 /**
@@ -63,8 +65,8 @@ export async function hasSlot(
     .maybeSingle();
 
   if (error) {
-    console.error(`[slot] hasSlot failed for ${sequenceId}/${contactId}/${localDate}:`, error.message);
-    throw new Error(`slot lookup failed: ${error.message}`);
+    console.error(`[slot] hasSlot failed for ${sequenceId}/${contactId}/${localDate}:`, JSON.stringify(error));
+    throw new Error(`slot lookup failed: ${JSON.stringify(error)}`);
   }
   return Boolean(data);
 }
@@ -94,8 +96,8 @@ export async function claimSlot(
     .select('contact_id');
 
   if (error) {
-    console.error(`[slot] claim failed for ${sequenceId}/${contactId}/${localDate}:`, error.message);
-    throw new Error(`slot claim failed: ${error.message}`);
+    console.error(`[slot] claim failed for ${sequenceId}/${contactId}/${localDate}:`, JSON.stringify(error));
+    throw new Error(`slot claim failed: ${JSON.stringify(error)}`);
   }
   // `data` is empty if the row already existed (because we asked for
   // ignoreDuplicates). New rows return with the inserted contact_id.
