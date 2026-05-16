@@ -136,13 +136,22 @@ class WorkerManager {
         const queueName = match[1];
         try {
           const q = getAccountQueue(queueName);
-          const [waiting, active, delayed] = await Promise.all([
+          const [waiting, active, delayed, prioritized] = await Promise.all([
             q.getWaitingCount(),
             q.getActiveCount(),
             q.getDelayedCount(),
+            // Prioritized count — jobs added with `priority` option go to a
+            // separate sorted set, NOT the waiting list. The orchestrator
+            // always sets priority (cohort priority); without this check the
+            // worker manager treats those queues as empty and never spawns a
+            // consumer. getPrioritizedCount() returns a Promise<number>.
+            q.getPrioritizedCount(),
           ]);
-          const total = waiting + active + delayed;
-          console.log(`WorkerManager: queue ${queueName} → waiting=${waiting} active=${active} delayed=${delayed}`);
+          const total = waiting + active + delayed + prioritized;
+          console.log(
+            `WorkerManager: queue ${queueName} → waiting=${waiting} active=${active} ` +
+              `delayed=${delayed} prioritized=${prioritized}`,
+          );
           if (total > 0) {
             found.add(queueName);
           }
