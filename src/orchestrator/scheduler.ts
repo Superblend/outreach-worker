@@ -23,7 +23,7 @@
 import { randomBytes } from 'crypto';
 import { supabase } from '../supabase';
 import { isWithinActiveWindow } from '../lib/time-utils';
-import { executionQueue, getAccountQueue } from '../queues/definitions';
+import { dispatchPendingQueue } from '../queues/definitions';
 import { getOrchestratorMode } from './mode-reader';
 import { countSlotsForDate, hasSlot, claimSlot, todayInSequenceTz } from './slot-manager';
 import { recordShadowDecision } from './shadow-logger';
@@ -36,21 +36,11 @@ import type {
 } from './types';
 
 /**
- * Per-process session ID for BullMQ jobId stability. Same pattern as
- * scanner.ts: stable within a session (dedupes waiting/delayed jobs),
- * unique across restarts (prevents stale failed jobs from blocking new
- * enqueues with the same execution+step pair).
+ * Per-process session ID for BullMQ jobId stability. Stable within a session
+ * (dedupes waiting/delayed jobs), unique across restarts (prevents stale
+ * failed jobs from blocking new enqueues with the same execution+step pair).
  */
 const ORCH_SESSION_ID = randomBytes(4).toString('hex');
-
-const LINKEDIN_STEP_TYPES = new Set([
-  'linkedin_invitation',
-  'linkedin_message',
-  'linkedin_profile_visit',
-  'linkedin_voice_note',
-  'linkedin_engage_post',
-  'linkedin_endorse',
-]);
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -390,109 +380,60 @@ async function emitDecision(
 }
 
 /**
- * Mirror of scanner.ts's enqueue logic, scoped to a single execution.
+ * Two-tier dispatch: push a minimal decision to `outreach-dispatch-pending`.
  *
- *   - LinkedIn step → per-account queue `outreach-linkedin-{accountId}`
- *   - Email step    → per-client queue  `outreach-email-client-{clientId}`
- *   - Anything else → shared queue      `outreach-executions`
+ * The router worker (src/workers/router.worker.ts) consumes this queue,
+ * resolves step_type + assigned accounts from the DB, and re-enqueues to the
+ * appropriate per-account (LinkedIn) or per-client (Email) queue. Keeping
+ * queue topology in the worker process matches the doc's contract:
+ * orchestrator decides WHEN, worker decides HOW.
  *
  * jobId = `exec-{exec_id}-{step_id}-{orch_session}`
  *   - Stable within a session → BullMQ dedupes when the orchestrator
  *     re-emits a decision for the same (exec, step) on subsequent wakes.
- *     Without this, every Realtime event re-enqueues even though the worker
- *     already has the job in flight.
  *   - Session suffix rotates on restart → old failed/stale jobs from a prior
  *     orchestrator process don't block new enqueues.
  *
  * We do NOT touch updated_at after enqueue. Scanner already skips
  * orchestrator-mode clients at the client_id level, so the row-level
- * race-guard touch is unnecessary. Touching here previously caused a
- * self-triggered loop: touch fires Realtime UPDATE → orchestrator wakes →
- * re-enqueues → touches again → ... BullMQ jobId dedupe absorbs the loop
- * at the queue level but it spams the event bus and starves other
- * sequences from getting CPU time.
+ * race-guard touch is unnecessary. Touching previously caused a
+ * self-triggered Realtime loop.
  */
 async function enqueueExecution(
   decision: OrchDecision,
-  candidate: ExecutionCandidate,
+  _candidate: ExecutionCandidate,
 ): Promise<void> {
-  // Normalize step_type from the PostgREST nested join result.
-  const raw = candidate.unipile_sequence_steps;
-  const stepData = Array.isArray(raw) ? raw[0] : raw;
-  const stepType = stepData?.step_type ?? 'unknown';
-
-  // Choose target queue.
-  let targetQueueName: string;
-  let channel: string;
-  if (LINKEDIN_STEP_TYPES.has(stepType)) {
-    const accountId = candidate.assigned_linkedin_account_id;
-    if (accountId) {
-      targetQueueName = `outreach-linkedin-${accountId}`;
-      channel = 'linkedin';
-    } else {
-      targetQueueName = 'outreach-executions';
-      channel = 'linkedin';
-    }
-  } else if (stepType === 'email') {
-    targetQueueName = `outreach-email-client-${decision.clientId}`;
-    channel = 'email';
-  } else {
-    targetQueueName = 'outreach-executions';
-    channel = stepType;
-  }
-
-  const targetQueue =
-    targetQueueName === 'outreach-executions'
-      ? executionQueue
-      : getAccountQueue(targetQueueName);
-
   const jobId = `exec-${decision.executionId}-${decision.stepId}-${ORCH_SESSION_ID}`;
-  const groupKey =
-    channel === 'linkedin'
-      ? `linkedin:${candidate.assigned_linkedin_account_id || 'unknown'}`
-      : channel === 'email'
-        ? `email-client:${decision.clientId}`
-        : `other:${decision.executionId}`;
 
   try {
-    await targetQueue.add(
-      'execute-step',
+    await dispatchPendingQueue.add(
+      'route-dispatch',
       {
         execution_id: decision.executionId,
-        group_key: groupKey,
-        channel,
         step_id: decision.stepId,
-        step_type: stepType,
+        client_id: decision.clientId,
+        contact_id: decision.contactId,
+        cohort_priority: decision.cohortPriority,
+        cohort_label: decision.cohortLabel,
       },
       {
         attempts: 3,
-        backoff: { type: 'exponential', delay: 5000 },
+        backoff: { type: 'exponential', delay: 2000 },
         jobId,
         priority: decision.cohortPriority,
         removeOnComplete: { age: 3600, count: 1000 },
         removeOnFail: { age: 86400, count: 5000 },
       },
     );
-    // Post-enqueue diagnostic — confirms BullMQ actually accepted the job
-    // from the orchestrator's perspective. If counts.waiting > 0 here but the
-    // worker reports 0, we have a cross-service Redis visibility issue.
-    let counts: Record<string, number> = {};
-    try {
-      counts = await targetQueue.getJobCounts(
-        'waiting', 'active', 'delayed', 'completed', 'failed', 'prioritized', 'paused', 'wait',
-      );
-    } catch (countErr) {
-      console.warn(`[orchestrator] getJobCounts failed: ${countErr instanceof Error ? countErr.message : String(countErr)}`);
-    }
     console.log(
-      `[orchestrator] enqueued exec=${decision.executionId} ` +
-        `queue=${targetQueueName} jobId=${jobId} priority=${decision.cohortPriority} ` +
-        `counts=${JSON.stringify(counts)}`,
+      `[orchestrator] dispatched exec=${decision.executionId} ` +
+        `step=${decision.stepId} priority=${decision.cohortPriority} ` +
+        `cohort=${decision.cohortLabel}`,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
-      `[orchestrator] enqueue failed exec=${decision.executionId}: ${msg}`,
+      `[orchestrator] dispatch enqueue failed exec=${decision.executionId}: ${msg}`,
     );
   }
 }

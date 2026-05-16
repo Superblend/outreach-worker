@@ -3,6 +3,7 @@ import { config } from './config';
 import { startScanner, triggerImmediateScan, SESSION_ID } from './scanner';
 import { startExecutionWorker } from './workers/execution.worker';
 import { startBatchWorker } from './workers/batch.worker';
+import { startRouterWorker } from './workers/router.worker';
 import { setupBullBoard } from './monitoring/bull-board';
 import { connection, executionQueue } from './queues/definitions';
 import { workerHealth } from './health';
@@ -148,6 +149,7 @@ async function initialize(): Promise<void> {
   startExecutionWorker();           // handles delay/conditional/other steps
   await workerManager.start();      // manages per-account LinkedIn & email workers
   startBatchWorker();
+  startRouterWorker();              // routes orchestrator's dispatch-pending jobs to per-account queues
   await startScanner();
 
   // Watchdog: check every 15s, restart if stale for 60s with pending work
