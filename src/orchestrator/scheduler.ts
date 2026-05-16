@@ -21,7 +21,7 @@
  */
 
 import { randomBytes } from 'crypto';
-import { supabase } from '../supabase';
+import { supabase, invokeEdgeFunction } from '../supabase';
 import { isWithinActiveWindow } from '../lib/time-utils';
 import { dispatchPendingQueue } from '../queues/definitions';
 import { getOrchestratorMode } from './mode-reader';
@@ -41,6 +41,14 @@ import type {
  * failed jobs from blocking new enqueues with the same execution+step pair).
  */
 const ORCH_SESSION_ID = randomBytes(4).toString('hex');
+
+/**
+ * Per-sequence debouncer for new-lead batch materialization. Prevents the
+ * orchestrator from invoking `unipile-process-batch-queue` on every Realtime
+ * event (could fire many times per second during burst activity).
+ */
+const lastMaterializeAt = new Map<string, number>();
+const MATERIALIZE_COOLDOWN_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -218,6 +226,67 @@ export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<voi
     `[scheduler] sequence=${seq.id} mode=${mode} decisions=${decisionsRecorded}` +
       (dailyLimitReached ? ' (daily_limit_reached during pass)' : ''),
   );
+
+  // 7. New-lead materialization: if there are due batches sitting in
+  //    `unipile_batch_queue` for this sequence, ask the existing
+  //    `unipile-process-batch-queue` edge function to materialize them into
+  //    executions. The edge function already handles dedup, account rotation,
+  //    active-day filter, and INSERT shape — we just decide WHEN to trigger
+  //    it. Replaces the daily 09 UTC cron's role for orchestrator-mode clients.
+  //
+  //    For shadow mode we don't materialize, because doing so would create
+  //    real executions that the legacy scanner would then dispatch — defeating
+  //    the "observe only" promise of shadow.
+  if (mode === 'orchestrator') {
+    await materializeDueBatches(seq);
+  }
+}
+
+/**
+ * Trigger `unipile-process-batch-queue` if there are due batches for this
+ * sequence and we haven't called it recently (per-sequence debouncer).
+ *
+ * The edge function processes ALL due batches for the given client_id in one
+ * pass. We invoke it per-client (not per-sequence) so a client with many
+ * sequences only generates one invocation per cooldown window.
+ */
+async function materializeDueBatches(seq: SequenceMeta): Promise<void> {
+  const key = `client:${seq.client_id}`;
+  const last = lastMaterializeAt.get(key) ?? 0;
+  const now = Date.now();
+  if (now - last < MATERIALIZE_COOLDOWN_MS) return;
+
+  // Are there actually due batches for this sequence? Cheap pre-check so we
+  // don't invoke the edge function speculatively on every wake.
+  const { data: dueBatches, error } = await supabase
+    .from('unipile_batch_queue')
+    .select('id', { head: false })
+    .eq('unipile_sequence_id', seq.id)
+    .eq('status', 'pending')
+    .lte('scheduled_for', new Date().toISOString())
+    .limit(1);
+
+  if (error) {
+    console.warn(`[orchestrator] materialize pre-check failed for sequence=${seq.id}:`, error.message);
+    return;
+  }
+  if (!dueBatches || dueBatches.length === 0) return;
+
+  // Mark cooldown BEFORE the call so concurrent wakes don't pile on.
+  lastMaterializeAt.set(key, now);
+
+  console.log(`[orchestrator] triggering batch materialization for client=${seq.client_id} (sequence ${seq.id} has due batches)`);
+  const { error: invokeErr } = await invokeEdgeFunction('unipile-process-batch-queue', {
+    client_id: seq.client_id,
+  });
+
+  if (invokeErr) {
+    console.error(`[orchestrator] batch materialization invoke failed for client=${seq.client_id}:`, invokeErr.message);
+    // Reset cooldown on failure so the next wake can retry sooner.
+    lastMaterializeAt.delete(key);
+  } else {
+    console.log(`[orchestrator] batch materialization completed for client=${seq.client_id}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
