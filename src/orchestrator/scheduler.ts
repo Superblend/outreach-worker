@@ -2,37 +2,50 @@
  * Core orchestrator scheduling logic.
  *
  * Triggered by a wake event (Realtime, poll-fallback, or startup scan), this
- * module decides what to do for one sequence:
+ * module decides what to do for one sequence. Output is one or more
+ * `OrchDecision` rows written to `orchestrator_shadow_log` (shadow mode).
  *
- *   1. Read sequence + client. Skip if client is `legacy` or sequence
- *      isn't `use_bullmq=true`.
- *   2. Validate active window / active days in sequence's timezone.
- *   3. Compute today's local date in that timezone — this is the slot date.
- *   4. Iterate cohorts in priority order: P1 → P2 → P3 → P4.
- *      For each cohort:
- *        - Fetch pending executions matching the cohort criteria.
- *        - For each candidate: check/claim slot (P2 same-day usually free).
- *        - If client is `shadow`: log the decision, do not enqueue.
- *        - If client is `orchestrator`: enqueue to the correct BullMQ queue,
- *          using the same patterns scanner.ts uses (per-account LinkedIn,
- *          per-client email, shared otherwise).
+ * SAFETY: `orchestrator` mode enqueue is intentionally NOT implemented in
+ * this file. Until the enqueue path is wired and tested in a follow-up
+ * commit, this scheduler refuses to act for clients in `orchestrator` mode
+ * and emits a loud error. Do NOT flip any client to `orchestrator` until
+ * that path is shipped. `shadow` mode works fully.
  *
- * IMPLEMENTATION NOTE (review): the heavy bits — cohort filtering, time
- * window validation, BullMQ jobId pattern — are deliberately stubbed here.
- * They'll be ported / shared with `scanner.ts` once the scaffold is approved.
- * The point of this file in the scaffold is the *flow*, not the SQL.
+ * Invariants preserved (mirrors scanner.ts):
+ *   - 30-second `updated_at` buffer to avoid races with concurrent workers.
+ *   - Cohort priority order from `cohortPriority()` (ported from scanner.ts).
+ *   - Active window / active days enforcement via `isWithinActiveWindow`.
+ *   - Slot logic lives INSIDE the cohort loop, not in place of it.
+ *   - Account assignment is NOT done here — orchestrator emits decisions
+ *     with `assigned_*_account_id = NULL`; worker assigns at dispatch time.
  */
 
 import { supabase } from '../supabase';
+import { isWithinActiveWindow } from '../lib/time-utils';
 import { getOrchestratorMode } from './mode-reader';
 import { countSlotsForDate, hasSlot, claimSlot, todayInSequenceTz } from './slot-manager';
 import { recordShadowDecision } from './shadow-logger';
 import type {
+  OrchCohortLabel,
   OrchDecision,
   OrchSequenceWakeEvent,
   OrchSkipReason,
   OrchestratorMode,
 } from './types';
+
+// ---------------------------------------------------------------------------
+// Tunables
+// ---------------------------------------------------------------------------
+
+/** Max executions considered per wake event. Per-sequence, so small budget. */
+const MAX_CANDIDATES_PER_WAKE = 500;
+
+/** Mirrors scanner.ts's updatedAtBuffer — race guard against concurrent workers. */
+const UPDATED_AT_BUFFER_MS = 30_000;
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 /**
  * Entry point called by the Realtime subscriber and poll fallback.
@@ -43,80 +56,168 @@ export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<voi
   const seq = await loadSequence(event.sequenceId);
   if (!seq) return;
 
-  // Out-of-scope: legacy clients & non-bullmq sequences are handled by the
-  // existing edge-function dispatcher + worker scanner.
+  // Out-of-scope: legacy sequences are handled by the existing edge-function
+  // dispatcher. Orchestrator only owns use_bullmq=true sequences.
   if (!seq.use_bullmq) {
-    return logSkip(event, seq.id, seq.client_id, 'not_bullmq_sequence');
+    return; // silent — this is a normal "not for us"
   }
 
   const mode = await getOrchestratorMode(seq.client_id);
   if (mode === 'legacy') {
-    return logSkip(event, seq.id, seq.client_id, 'client_legacy_mode');
+    return; // not for us, scanner handles
   }
 
-  // 2. Sequence-level gates: status + active window + active days.
+  // 2. Sequence-level gates.
   if (seq.status !== 'active') {
-    return logSkip(event, seq.id, seq.client_id, 'sequence_not_active');
+    return logSkip(event, seq, null, 'sequence_not_active', mode);
   }
 
-  const localDate = todayInSequenceTz(seq.timezone);
-  if (!isActiveDayAndWindow(seq, new Date())) {
-    return logSkip(
-      event,
-      seq.id,
-      seq.client_id,
-      'outside_active_window' /* or 'inactive_day' — refine in impl */,
-    );
+  const windowCheck = isWithinActiveWindow(
+    {
+      timezone: seq.timezone,
+      active_days: seq.active_days,
+      scheduled_start_time: seq.scheduled_start_time,
+      scheduled_end_time: seq.scheduled_end_time,
+    },
+    new Date(),
+  );
+  if (!windowCheck.ok) {
+    const reasonStr = (windowCheck as { ok: false; reason: string }).reason;
+    const reason: OrchSkipReason = reasonStr.startsWith('inactive_day')
+      ? 'inactive_day'
+      : 'outside_active_window';
+    return logSkip(event, seq, null, reason, mode);
   }
 
-  // 3. Daily slot budget check.
+  // 3. Daily slot budget for today (sequence-local date).
+  const localDate = todayInSequenceTz(seq.timezone ?? 'UTC');
   const slotsUsed = await countSlotsForDate(seq.id, localDate);
-  const slotsAvailable = Math.max(0, (seq.daily_batch_size ?? 0) - slotsUsed);
+  const dailyBudget = seq.daily_batch_size ?? 0;
+  let slotsAvailable = Math.max(0, dailyBudget - slotsUsed);
 
-  // 4. Cohort loop — TODO in impl. The order MUST match scanner.ts's
-  //    cohortPriority() so shadow comparison can pair decisions.
-  //
-  //    Pseudocode:
-  //      for cohort of [P1_new, P2_same_day, P3_multi_day, P4_low]:
-  //        candidates = fetchCohortCandidates(seq, cohort, localDate);
-  //        for candidate in candidates:
-  //          consumesSlot = !(await hasSlot(seq.id, candidate.lead_id, localDate));
-  //          if (consumesSlot && slotsAvailable <= 0) {
-  //            recordShadowDecision({ ..., skipReason: 'daily_limit_reached' });
-  //            continue;
-  //          }
-  //          if (consumesSlot) {
-  //            const claimed = await claimSlot(seq.id, candidate.lead_id, localDate);
-  //            if (!claimed) {
-  //              // Someone else won the race; skip this candidate.
-  //              continue;
-  //            }
-  //            slotsAvailable--;
-  //          }
-  //          const decision = buildDecision(...);
-  //          if (mode === 'shadow') {
-  //            await recordShadowDecision(decision, event);
-  //          } else {
-  //            await enqueueExecution(decision);
-  //          }
+  // 4. Fetch due executions for this sequence.
+  const candidates = await fetchDueExecutions(seq.id);
+  if (candidates.length === 0) {
+    console.log(`[scheduler] wake sequence=${seq.id} mode=${mode} due=0 source=${event.source}`);
+    return;
+  }
 
-  // Stub for the scaffold: emit a noop log entry so we can see wakes in logs.
+  // 5. Sort by cohort priority (ascending — lower number = higher priority).
+  //    Mirrors scanner.ts's cohortPriority() exactly so shadow comparisons
+  //    pair correctly with legacy decisions.
+  const now = Date.now();
+  const sorted = candidates
+    .map((c) => ({
+      exec: c,
+      priority: cohortPriority(c.priority_cohort, c.first_touch_done, c.next_execution_at, now),
+    }))
+    .sort((a, b) => a.priority - b.priority);
+
   console.log(
-    `[scheduler] wake sequence=${seq.id} client=${seq.client_id} mode=${mode} ` +
-      `slotsUsed=${slotsUsed} slotsAvailable=${slotsAvailable} source=${event.source}`,
+    `[scheduler] wake sequence=${seq.id} mode=${mode} due=${sorted.length} ` +
+      `slotsUsed=${slotsUsed}/${dailyBudget} source=${event.source}`,
+  );
+
+  // 6. Iterate candidates in cohort order. For each, decide slot need,
+  //    claim if necessary, emit decision.
+  let decisionsRecorded = 0;
+  let dailyLimitReached = false;
+
+  for (const { exec, priority } of sorted) {
+    const label = cohortLabelFromPriority(priority);
+
+    // Same-day chain (P2): lead already has a slot today → free continuation.
+    let consumesSlot: boolean;
+    try {
+      consumesSlot = !(await hasSlot(seq.id, exec.lead_id, localDate));
+    } catch {
+      // Slot read failed — fail closed by skipping this candidate this pass.
+      continue;
+    }
+
+    if (consumesSlot && slotsAvailable <= 0) {
+      // Budget exhausted. Record one skip-decision per remaining candidate
+      // so shadow comparison can confirm "we agreed with legacy on the cap".
+      // Then stop scanning (no later candidate can claim a slot either).
+      await emitDecision(
+        {
+          sequenceId: seq.id,
+          clientId: seq.client_id,
+          leadId: exec.lead_id,
+          executionId: exec.id,
+          stepId: exec.current_step_id,
+          cohortPriority: priority,
+          cohortLabel: label,
+          nextExecutionAt: exec.next_execution_at,
+          consumesSlot: false, // didn't claim
+          skipReason: 'daily_limit_reached',
+        },
+        event,
+        mode,
+      );
+      decisionsRecorded++;
+      dailyLimitReached = true;
+      continue;
+    }
+
+    if (consumesSlot) {
+      const claimed = await claimSlot(seq.id, exec.lead_id, localDate);
+      if (!claimed) {
+        // Race: another orchestrator pass beat us to it. Skip silently — the
+        // winning pass already recorded a decision for this lead.
+        continue;
+      }
+      slotsAvailable--;
+    }
+
+    await emitDecision(
+      {
+        sequenceId: seq.id,
+        clientId: seq.client_id,
+        leadId: exec.lead_id,
+        executionId: exec.id,
+        stepId: exec.current_step_id,
+        cohortPriority: priority,
+        cohortLabel: label,
+        nextExecutionAt: exec.next_execution_at,
+        consumesSlot,
+      },
+      event,
+      mode,
+    );
+    decisionsRecorded++;
+  }
+
+  console.log(
+    `[scheduler] sequence=${seq.id} mode=${mode} decisions=${decisionsRecorded}` +
+      (dailyLimitReached ? ' (daily_limit_reached during pass)' : ''),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
 
 interface SequenceMeta {
   id: string;
   client_id: string;
   status: string;
   use_bullmq: boolean;
-  timezone: string;
+  timezone: string | null;
   daily_batch_size: number | null;
   scheduled_start_time: string | null;
   scheduled_end_time: string | null;
   active_days: number[] | null;
+}
+
+interface ExecutionCandidate {
+  id: string;
+  lead_id: string;
+  current_step_id: string;
+  batch_number: number | null;
+  next_execution_at: string;
+  priority_cohort: string | null;
+  first_touch_done: boolean;
 }
 
 async function loadSequence(sequenceId: string): Promise<SequenceMeta | null> {
@@ -129,53 +230,141 @@ async function loadSequence(sequenceId: string): Promise<SequenceMeta | null> {
     .eq('id', sequenceId)
     .maybeSingle();
   if (error || !data) return null;
-  return data as SequenceMeta;
+  return data as unknown as SequenceMeta;
 }
 
 /**
- * STUB: validate that "now" falls inside the sequence's active window in its
- * local timezone, and that today is one of the configured active days.
+ * Fetch executions due now for this sequence.
  *
- * Real impl reuses the formatToParts-based helpers from scanner.ts /
- * unipile-sync-sequence-leads/index.ts (utcInstantForLocal, localMinutesOfDay,
- * localWeekday) — same logic, lifted into a shared lib.
+ * Single query (per-sequence volume is bounded by daily_batch_size, typically
+ * dozens). Sorting by cohort priority happens in-memory after the fetch.
+ *
+ * Filters:
+ *   - status='running' AND execution_state='not_started' (matches scanner.ts)
+ *   - next_execution_at <= now (due now or overdue)
+ *   - updated_at < now - 30s (race guard against concurrent workers / passes)
  */
-function isActiveDayAndWindow(_seq: SequenceMeta, _now: Date): boolean {
-  return true;
+async function fetchDueExecutions(sequenceId: string): Promise<ExecutionCandidate[]> {
+  const nowIso = new Date().toISOString();
+  const updatedAtBuffer = new Date(Date.now() - UPDATED_AT_BUFFER_MS).toISOString();
+
+  const { data, error } = await supabase
+    .from('unipile_sequence_executions')
+    .select(
+      'id, lead_id, current_step_id, batch_number, next_execution_at, ' +
+        'priority_cohort, first_touch_done',
+    )
+    .eq('unipile_sequence_id', sequenceId)
+    .eq('status', 'running')
+    .eq('execution_state', 'not_started')
+    .lte('next_execution_at', nowIso)
+    .lt('updated_at', updatedAtBuffer)
+    .order('batch_number', { ascending: true, nullsFirst: true })
+    .order('next_execution_at', { ascending: true })
+    .limit(MAX_CANDIDATES_PER_WAKE);
+
+  if (error) {
+    console.error(`[scheduler] fetch failed for sequence=${sequenceId}:`, error.message);
+    return [];
+  }
+  return (data ?? []) as unknown as ExecutionCandidate[];
 }
 
 /**
- * Shadow-mode courtesy: even skip reasons get logged in shadow mode so
- * comparison can confirm "old path agreed this was skipped too."
- * In orchestrator mode, skips just get a console line.
+ * Ported verbatim from scanner.ts. Lower number = higher BullMQ priority.
+ * Keeping the exact integer mapping is what lets shadow-mode comparison
+ * pair our decisions with the legacy scanner's enqueues.
+ */
+function cohortPriority(
+  cohort: string | null,
+  firstTouchDone: boolean,
+  nextExecutionAt: string,
+  now: number = Date.now(),
+): number {
+  if (cohort === 'in_flight') {
+    const overdueMs = now - new Date(nextExecutionAt).getTime();
+    if (overdueMs > 86_400_000) return 1;
+    if (overdueMs > 3_600_000) return 2;
+    if (overdueMs > 900_000) return 3;
+    return 6;
+  }
+  if (cohort === 'new_today') return firstTouchDone ? 5 : 4;
+  return 7;
+}
+
+/**
+ * Map the numeric priority into a human label for the shadow log.
+ * The numeric value is the authoritative input to BullMQ; the label is
+ * for analysis queries.
+ */
+function cohortLabelFromPriority(priority: number): OrchCohortLabel {
+  if (priority <= 3) return 'p3_multi_day_follow_up'; // overdue in_flight buckets
+  if (priority === 4) return 'p1_new_contact';
+  if (priority === 5) return 'p2_same_day_chain';
+  if (priority === 6) return 'p2_same_day_chain'; // on-time in_flight, still same-day class
+  return 'p4_low_priority';
+}
+
+/**
+ * Emit a decision through the right path for the current mode.
+ *
+ *   shadow      → write to orchestrator_shadow_log, that's it.
+ *   orchestrator → ENQUEUE PATH NOT YET IMPLEMENTED. Logs an error and skips.
+ *                  Until this path is shipped, no client should be in
+ *                  orchestrator mode in any environment. The mode-reader
+ *                  CHECK constraint allows the value; the scaffold-time guard
+ *                  is here, in the dispatch logic. Belt + suspenders.
+ *   legacy      → unreachable (we returned earlier).
+ */
+async function emitDecision(
+  decision: OrchDecision,
+  event: OrchSequenceWakeEvent,
+  mode: OrchestratorMode,
+): Promise<void> {
+  if (mode === 'shadow') {
+    await recordShadowDecision(decision, event);
+    return;
+  }
+  if (mode === 'orchestrator') {
+    console.error(
+      `[scheduler] REFUSING ENQUEUE — orchestrator-mode enqueue not yet shipped. ` +
+        `sequence=${decision.sequenceId} execution=${decision.executionId} ` +
+        `lead=${decision.leadId}. Set client back to 'shadow' until enqueue lands.`,
+    );
+    return;
+  }
+}
+
+/**
+ * Shadow-mode courtesy: even skip reasons get logged in shadow so comparison
+ * can confirm "old path agreed this was skipped too." In orchestrator mode
+ * (currently unreachable for enqueues), skips just go to the console.
  */
 async function logSkip(
   event: OrchSequenceWakeEvent,
-  sequenceId: string,
-  clientId: string,
+  seq: SequenceMeta,
+  exec: ExecutionCandidate | null,
   reason: OrchSkipReason,
+  mode: OrchestratorMode,
 ): Promise<void> {
-  const mode: OrchestratorMode = await getOrchestratorMode(clientId).catch(() => 'legacy');
   if (mode !== 'shadow') {
-    console.log(`[scheduler] skip sequence=${sequenceId} reason=${reason}`);
+    console.log(`[scheduler] skip sequence=${seq.id} reason=${reason}`);
     return;
   }
-  // In shadow we still want a row so divergence analysis sees "we skipped X".
-  const stubDecision: OrchDecision = {
-    sequenceId,
-    clientId,
-    leadId: '',
-    executionId: null,
-    stepId: '',
+  const stub: OrchDecision = {
+    sequenceId: seq.id,
+    clientId: seq.client_id,
+    leadId: exec?.lead_id ?? '',
+    executionId: exec?.id ?? null,
+    stepId: exec?.current_step_id ?? '',
     cohortPriority: 0,
     cohortLabel: 'p4_low_priority',
-    nextExecutionAt: event.observedAt,
+    nextExecutionAt: exec?.next_execution_at ?? event.observedAt,
     consumesSlot: false,
     skipReason: reason,
   };
-  await recordShadowDecision(stubDecision, event);
+  await recordShadowDecision(stub, event);
 }
 
-// Stub helpers exported for testing & future implementation. Intentionally
-// not implemented in the scaffold to keep the surface small.
-export const __TESTING__ = { hasSlot, claimSlot };
+// Exported for testing — keeps the file lean while letting tests poke internals.
+export const __TESTING__ = { cohortPriority, cohortLabelFromPriority, fetchDueExecutions };
