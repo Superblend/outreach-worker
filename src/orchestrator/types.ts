@@ -25,7 +25,13 @@ export interface OrchSequenceWakeEvent {
 export interface OrchDecision {
   sequenceId: string;
   clientId: string;
-  leadId: string;
+  /**
+   * The contact this decision is about. `unipile_sequence_executions.contact_id`
+   * is the current model for the message subject; `lead_id` on executions is
+   * legacy and mostly NULL in recent data. Empty string allowed for skip-only
+   * decisions that don't pertain to a specific contact.
+   */
+  contactId: string;
   /** Existing execution row, if any. Null means "create a new execution". */
   executionId: string | null;
   /** Step the orchestrator intends to run. */
@@ -76,7 +82,7 @@ export type OrchSkipReason =
 /** Row shape for `unipile_sequence_daily_leads` slot reservation table. */
 export interface SlotRow {
   unipile_sequence_id: string;
-  lead_id: string;
+  contact_id: string;
   /** Date in the sequence's local timezone, YYYY-MM-DD. */
   date: string;
   slot_claimed_at: string;
@@ -86,7 +92,7 @@ export interface SlotRow {
 export interface ShadowLogRow {
   sequence_id: string;
   client_id: string;
-  lead_id: string;
+  contact_id: string;
   execution_id: string | null;
   step_id: string;
   cohort_label: OrchCohortLabel;

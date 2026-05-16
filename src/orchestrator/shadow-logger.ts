@@ -16,7 +16,7 @@ export async function recordShadowDecision(
   const row: ShadowLogRow = {
     sequence_id: decision.sequenceId,
     client_id: decision.clientId,
-    lead_id: decision.leadId,
+    contact_id: decision.contactId,
     execution_id: decision.executionId,
     step_id: decision.stepId,
     cohort_label: decision.cohortLabel,
@@ -47,7 +47,7 @@ export async function recordShadowDecisionsBatch(
   const rows: ShadowLogRow[] = decisions.map(({ decision, event }) => ({
     sequence_id: decision.sequenceId,
     client_id: decision.clientId,
-    lead_id: decision.leadId,
+    contact_id: decision.contactId,
     execution_id: decision.executionId,
     step_id: decision.stepId,
     cohort_label: decision.cohortLabel,

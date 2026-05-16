@@ -46,24 +46,24 @@ export async function countSlotsForDate(
 }
 
 /**
- * Does this lead already have a slot for today in this sequence's local tz?
+ * Does this contact already have a slot for today in this sequence's local tz?
  * Used to short-circuit same-day chain continuations (P2) — no slot needed.
  */
 export async function hasSlot(
   sequenceId: string,
-  leadId: string,
+  contactId: string,
   localDate: string,
 ): Promise<boolean> {
   const { data, error } = await supabase
     .from('unipile_sequence_daily_leads')
-    .select('lead_id')
+    .select('contact_id')
     .eq('unipile_sequence_id', sequenceId)
-    .eq('lead_id', leadId)
+    .eq('contact_id', contactId)
     .eq('date', localDate)
     .maybeSingle();
 
   if (error) {
-    console.error(`[slot] hasSlot failed for ${sequenceId}/${leadId}/${localDate}:`, error.message);
+    console.error(`[slot] hasSlot failed for ${sequenceId}/${contactId}/${localDate}:`, error.message);
     throw new Error(`slot lookup failed: ${error.message}`);
   }
   return Boolean(data);
@@ -74,11 +74,11 @@ export async function hasSlot(
  * already existed (e.g., a concurrent orchestrator pass beat us to it — also
  * a valid outcome).
  *
- * Composite PK (sequence_id, lead_id, date) gives us the dedupe for free.
+ * Composite PK (sequence_id, contact_id, date) gives us the dedupe for free.
  */
 export async function claimSlot(
   sequenceId: string,
-  leadId: string,
+  contactId: string,
   localDate: string,
 ): Promise<boolean> {
   const { data, error } = await supabase
@@ -86,18 +86,18 @@ export async function claimSlot(
     .upsert(
       {
         unipile_sequence_id: sequenceId,
-        lead_id: leadId,
+        contact_id: contactId,
         date: localDate,
       },
-      { onConflict: 'unipile_sequence_id,lead_id,date', ignoreDuplicates: true },
+      { onConflict: 'unipile_sequence_id,contact_id,date', ignoreDuplicates: true },
     )
-    .select('lead_id');
+    .select('contact_id');
 
   if (error) {
-    console.error(`[slot] claim failed for ${sequenceId}/${leadId}/${localDate}:`, error.message);
+    console.error(`[slot] claim failed for ${sequenceId}/${contactId}/${localDate}:`, error.message);
     throw new Error(`slot claim failed: ${error.message}`);
   }
   // `data` is empty if the row already existed (because we asked for
-  // ignoreDuplicates). New rows return with the inserted lead_id.
+  // ignoreDuplicates). New rows return with the inserted contact_id.
   return Array.isArray(data) && data.length > 0;
 }

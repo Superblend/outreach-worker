@@ -125,11 +125,22 @@ export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<voi
 
   for (const { exec, priority } of sorted) {
     const label = cohortLabelFromPriority(priority);
+    // Subject of this execution: prefer contact_id (current model);
+    // fall back to lead_id for legacy executions. If neither is set we
+    // can't track slot ownership — skip safely.
+    const subjectId = exec.contact_id ?? exec.lead_id;
+    if (!subjectId) {
+      console.log(
+        `[scheduler] skip execution=${exec.id} reason=no_subject_id ` +
+          `(both contact_id and lead_id are NULL — cannot reserve a slot)`,
+      );
+      continue;
+    }
 
-    // Same-day chain (P2): lead already has a slot today → free continuation.
+    // Same-day chain (P2): contact already has a slot today → free continuation.
     let consumesSlot: boolean;
     try {
-      consumesSlot = !(await hasSlot(seq.id, exec.lead_id, localDate));
+      consumesSlot = !(await hasSlot(seq.id, subjectId, localDate));
     } catch {
       // Slot read failed — fail closed by skipping this candidate this pass.
       continue;
@@ -143,7 +154,7 @@ export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<voi
         {
           sequenceId: seq.id,
           clientId: seq.client_id,
-          leadId: exec.lead_id,
+          contactId: subjectId,
           executionId: exec.id,
           stepId: exec.current_step_id,
           cohortPriority: priority,
@@ -161,10 +172,10 @@ export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<voi
     }
 
     if (consumesSlot) {
-      const claimed = await claimSlot(seq.id, exec.lead_id, localDate);
+      const claimed = await claimSlot(seq.id, subjectId, localDate);
       if (!claimed) {
         // Race: another orchestrator pass beat us to it. Skip silently — the
-        // winning pass already recorded a decision for this lead.
+        // winning pass already recorded a decision for this contact.
         continue;
       }
       slotsAvailable--;
@@ -174,7 +185,7 @@ export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<voi
       {
         sequenceId: seq.id,
         clientId: seq.client_id,
-        leadId: exec.lead_id,
+        contactId: subjectId,
         executionId: exec.id,
         stepId: exec.current_step_id,
         cohortPriority: priority,
@@ -212,7 +223,8 @@ interface SequenceMeta {
 
 interface ExecutionCandidate {
   id: string;
-  lead_id: string;
+  contact_id: string | null;
+  lead_id: string | null;
   current_step_id: string;
   batch_number: number | null;
   next_execution_at: string;
@@ -251,7 +263,7 @@ async function fetchDueExecutions(sequenceId: string): Promise<ExecutionCandidat
   const { data, error } = await supabase
     .from('unipile_sequence_executions')
     .select(
-      'id, lead_id, current_step_id, batch_number, next_execution_at, ' +
+      'id, contact_id, lead_id, current_step_id, batch_number, next_execution_at, ' +
         'priority_cohort, first_touch_done',
     )
     .eq('unipile_sequence_id', sequenceId)
@@ -354,7 +366,7 @@ async function logSkip(
   const stub: OrchDecision = {
     sequenceId: seq.id,
     clientId: seq.client_id,
-    leadId: exec?.lead_id ?? '',
+    contactId: exec?.contact_id ?? exec?.lead_id ?? '',
     executionId: exec?.id ?? null,
     stepId: exec?.current_step_id ?? '',
     cohortPriority: 0,
