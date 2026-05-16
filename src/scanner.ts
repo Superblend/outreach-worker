@@ -51,6 +51,32 @@ async function scanAndEnqueue() {
   const updatedAtBuffer = new Date(now.getTime() - 30000).toISOString();
 
   // ========================================
+  // ORCHESTRATOR MIGRATION: skip clients in orchestrator mode.
+  // Those are owned by the outreach-orchestrator service; if scanner also
+  // enqueued, BullMQ would receive two job entries (different session IDs →
+  // different jobIds → no dedupe). Filter in-memory after the fetch to keep
+  // the SQL simple and to gracefully handle envs where the migration hasn't
+  // applied yet (column missing → empty skip list, scanner behaves as before).
+  // ========================================
+  let skipClientIds: string[] = [];
+  try {
+    const { data: orchClients, error: orchErr } = await supabase
+      .from('clients')
+      .select('id')
+      .eq('orchestrator_mode', 'orchestrator');
+    if (!orchErr && orchClients) {
+      skipClientIds = orchClients.map((c: any) => c.id);
+    }
+  } catch {
+    // Column may not exist (e.g., prod before migration). Treat as "skip none".
+  }
+  const skipSet = new Set(skipClientIds);
+  const filterByOrchMode = (rows: any[]) =>
+    skipSet.size === 0
+      ? rows
+      : rows.filter((e: any) => !skipSet.has(e.unipile_sequences?.client_id));
+
+  // ========================================
   // SCAN DUE EXECUTIONS (use_bullmq=true only)
   // Two-pass approach: overdue in_flight rows are fetched first so they
   // are always enqueued regardless of how many new-campaign executions exist.
@@ -90,13 +116,6 @@ async function scanAndEnqueue() {
   // Pass 2 — all due now (remaining budget, deduped against Pass 1)
   const seenIds = new Set((overdueRows || []).map((e: any) => e.id));
   const pass2Limit = config.scanLimit - (overdueRows?.length || 0);
-  // ORCHESTRATOR MIGRATION (do not enable yet): once the orchestrator service
-  // is deployed and `clients.orchestrator_mode` column exists, both queries
-  // here need `.neq('unipile_sequences.clients.orchestrator_mode', 'orchestrator')`
-  // added via a `clients!inner(orchestrator_mode)` join, so the scanner stops
-  // double-dispatching for clients the orchestrator now owns. Coordinate this
-  // change with the migration deployment — adding it before the column exists
-  // makes this query throw and breaks all use_bullmq=true dispatch.
   const { data: generalRows, error: generalErr } = await supabase
     .from('unipile_sequence_executions')
     .select(EXECUTION_SELECT)
@@ -112,14 +131,19 @@ async function scanAndEnqueue() {
 
   if (generalErr) console.error('Scanner: general pass failed:', generalErr.message);
 
-  const dueExecutions = [
-    ...(overdueRows || []),
-    ...(generalRows || []).filter((e: any) => !seenIds.has(e.id)),
-  ];
+  const overdueFiltered = filterByOrchMode(overdueRows || []);
+  const generalFiltered = filterByOrchMode((generalRows || []).filter((e: any) => !seenIds.has(e.id)));
+  const dueExecutions = [...overdueFiltered, ...generalFiltered];
+
+  const skippedDueToOrchMode =
+    (overdueRows?.length || 0) + (generalRows || []).filter((e: any) => !seenIds.has(e.id)).length
+    - dueExecutions.length;
 
   console.log(
     `Scanner: found ${dueExecutions.length} due executions ` +
-    `(overdue in_flight=${overdueRows?.length || 0}, general=${(generalRows || []).filter((e: any) => !seenIds.has(e.id)).length})`
+    `(overdue in_flight=${overdueFiltered.length}, general=${generalFiltered.length}` +
+    (skippedDueToOrchMode > 0 ? `, skipped_orch_mode=${skippedDueToOrchMode}` : '') +
+    ')'
   );
 
   if (dueExecutions && dueExecutions.length > 0) {

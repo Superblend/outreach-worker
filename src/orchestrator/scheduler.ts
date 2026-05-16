@@ -20,8 +20,10 @@
  *     with `assigned_*_account_id = NULL`; worker assigns at dispatch time.
  */
 
+import { randomBytes } from 'crypto';
 import { supabase } from '../supabase';
 import { isWithinActiveWindow } from '../lib/time-utils';
+import { executionQueue, getAccountQueue } from '../queues/definitions';
 import { getOrchestratorMode } from './mode-reader';
 import { countSlotsForDate, hasSlot, claimSlot, todayInSequenceTz } from './slot-manager';
 import { recordShadowDecision } from './shadow-logger';
@@ -32,6 +34,23 @@ import type {
   OrchSkipReason,
   OrchestratorMode,
 } from './types';
+
+/**
+ * Per-process session ID for BullMQ jobId stability. Same pattern as
+ * scanner.ts: stable within a session (dedupes waiting/delayed jobs),
+ * unique across restarts (prevents stale failed jobs from blocking new
+ * enqueues with the same execution+step pair).
+ */
+const ORCH_SESSION_ID = randomBytes(4).toString('hex');
+
+const LINKEDIN_STEP_TYPES = new Set([
+  'linkedin_invitation',
+  'linkedin_message',
+  'linkedin_profile_visit',
+  'linkedin_voice_note',
+  'linkedin_engage_post',
+  'linkedin_endorse',
+]);
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -169,6 +188,7 @@ export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<voi
         },
         event,
         mode,
+        exec,
       );
       decisionsRecorded++;
       dailyLimitReached = true;
@@ -199,6 +219,7 @@ export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<voi
       },
       event,
       mode,
+      exec,
     );
     decisionsRecorded++;
   }
@@ -234,6 +255,11 @@ interface ExecutionCandidate {
   next_execution_at: string;
   priority_cohort: string | null;
   first_touch_done: boolean;
+  assigned_linkedin_account_id: string | null;
+  assigned_email_account_id: string | null;
+  // Joined from unipile_sequence_steps. PostgREST returns either an object or
+  // a single-element array depending on cardinality; we normalize at use site.
+  unipile_sequence_steps: { step_type: string } | { step_type: string }[] | null;
 }
 
 async function loadSequence(sequenceId: string): Promise<SequenceMeta | null> {
@@ -268,10 +294,12 @@ async function fetchDueExecutions(sequenceId: string): Promise<ExecutionCandidat
 
   const { data, error } = await supabase
     .from('unipile_sequence_executions')
-    .select(
-      'id, contact_id, lead_id, current_step_id, batch_number, next_execution_at, ' +
-        'priority_cohort, first_touch_done',
-    )
+    .select(`
+      id, contact_id, lead_id, current_step_id, batch_number, next_execution_at,
+      priority_cohort, first_touch_done,
+      assigned_linkedin_account_id, assigned_email_account_id,
+      unipile_sequence_steps!unipile_sequence_executions_current_step_id_fkey(step_type)
+    `)
     .eq('unipile_sequence_id', sequenceId)
     .eq('status', 'running')
     .eq('execution_state', 'not_started')
@@ -326,29 +354,134 @@ function cohortLabelFromPriority(priority: number): OrchCohortLabel {
  * Emit a decision through the right path for the current mode.
  *
  *   shadow      → write to orchestrator_shadow_log, that's it.
- *   orchestrator → ENQUEUE PATH NOT YET IMPLEMENTED. Logs an error and skips.
- *                  Until this path is shipped, no client should be in
- *                  orchestrator mode in any environment. The mode-reader
- *                  CHECK constraint allows the value; the scaffold-time guard
- *                  is here, in the dispatch logic. Belt + suspenders.
+ *   orchestrator → enqueue to the right BullMQ queue (per-account LinkedIn,
+ *                  per-client email, or shared `outreach-executions`).
+ *                  Also touches the execution row's updated_at so the
+ *                  scanner-side cadence dedupe doesn't re-pick it.
  *   legacy      → unreachable (we returned earlier).
+ *
+ * For skip-decisions (skipReason set), we never enqueue regardless of mode —
+ * a skip is by definition "do nothing now."
  */
 async function emitDecision(
   decision: OrchDecision,
   event: OrchSequenceWakeEvent,
   mode: OrchestratorMode,
+  candidate: ExecutionCandidate,
 ): Promise<void> {
   if (mode === 'shadow') {
     await recordShadowDecision(decision, event);
     return;
   }
   if (mode === 'orchestrator') {
-    console.error(
-      `[scheduler] REFUSING ENQUEUE — orchestrator-mode enqueue not yet shipped. ` +
-        `sequence=${decision.sequenceId} execution=${decision.executionId} ` +
-        `lead=${decision.leadId}. Set client back to 'shadow' until enqueue lands.`,
-    );
+    if (decision.skipReason) {
+      // Skip decisions in orchestrator mode are silent except in logs.
+      // The corresponding execution remains "running, not_started" and will
+      // be re-evaluated on the next wake.
+      console.log(
+        `[orchestrator] skip execution=${decision.executionId} ` +
+          `reason=${decision.skipReason}`,
+      );
+      return;
+    }
+    await enqueueExecution(decision, candidate);
     return;
+  }
+}
+
+/**
+ * Mirror of scanner.ts's enqueue logic, scoped to a single execution.
+ *
+ *   - LinkedIn step → per-account queue `outreach-linkedin-{accountId}`
+ *   - Email step    → per-client queue  `outreach-email-client-{clientId}`
+ *   - Anything else → shared queue      `outreach-executions`
+ *
+ * jobId = `exec-{exec_id}-{step_id}-{orch_session}`
+ *   - Stable within a session → BullMQ dedupes if scanner also tries to enqueue
+ *     the same execution+step under the SAME session (only matters once the
+ *     scanner skip filter is in place; this is the safe default).
+ *   - Session suffix rotates on restart → old failed/stale jobs from a prior
+ *     orchestrator process don't block new enqueues.
+ *
+ * After enqueue, we touch updated_at to push the row past scanner's 30s race
+ * guard so scanner skips it during canary windows.
+ */
+async function enqueueExecution(
+  decision: OrchDecision,
+  candidate: ExecutionCandidate,
+): Promise<void> {
+  // Normalize step_type from the PostgREST nested join result.
+  const raw = candidate.unipile_sequence_steps;
+  const stepData = Array.isArray(raw) ? raw[0] : raw;
+  const stepType = stepData?.step_type ?? 'unknown';
+
+  // Choose target queue.
+  let targetQueueName: string;
+  let channel: string;
+  if (LINKEDIN_STEP_TYPES.has(stepType)) {
+    const accountId = candidate.assigned_linkedin_account_id;
+    if (accountId) {
+      targetQueueName = `outreach-linkedin-${accountId}`;
+      channel = 'linkedin';
+    } else {
+      targetQueueName = 'outreach-executions';
+      channel = 'linkedin';
+    }
+  } else if (stepType === 'email') {
+    targetQueueName = `outreach-email-client-${decision.clientId}`;
+    channel = 'email';
+  } else {
+    targetQueueName = 'outreach-executions';
+    channel = stepType;
+  }
+
+  const targetQueue =
+    targetQueueName === 'outreach-executions'
+      ? executionQueue
+      : getAccountQueue(targetQueueName);
+
+  const jobId = `exec-${decision.executionId}-${decision.stepId}-${ORCH_SESSION_ID}`;
+  const groupKey =
+    channel === 'linkedin'
+      ? `linkedin:${candidate.assigned_linkedin_account_id || 'unknown'}`
+      : channel === 'email'
+        ? `email-client:${decision.clientId}`
+        : `other:${decision.executionId}`;
+
+  try {
+    await targetQueue.add(
+      'execute-step',
+      {
+        execution_id: decision.executionId,
+        group_key: groupKey,
+        channel,
+        step_id: decision.stepId,
+        step_type: stepType,
+      },
+      {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 5000 },
+        jobId,
+        priority: decision.cohortPriority,
+        removeOnComplete: { age: 3600, count: 1000 },
+        removeOnFail: { age: 86400, count: 5000 },
+      },
+    );
+    console.log(
+      `[orchestrator] enqueued exec=${decision.executionId} ` +
+        `queue=${targetQueueName} jobId=${jobId} priority=${decision.cohortPriority}`,
+    );
+
+    // Touch updated_at so the scanner's 30s race guard skips this row.
+    await supabase
+      .from('unipile_sequence_executions')
+      .update({ updated_at: new Date().toISOString() })
+      .eq('id', decision.executionId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[orchestrator] enqueue failed exec=${decision.executionId}: ${msg}`,
+    );
   }
 }
 
