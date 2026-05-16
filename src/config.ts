@@ -14,7 +14,12 @@ export const config = {
     anonKey: required('SUPABASE_ANON_KEY'),
   },
   unipile: {
-    apiKey: required('UNIPILE_API_KEY'),
+    // Not `required()` — the orchestrator service uses the same config
+    // module but never calls Unipile. If a Unipile request happens at
+    // runtime without a key, unipile-fetch.ts will fail HTTP with 401
+    // (or short-circuit if DRY_RUN is set). The worker's Railway env
+    // still sets this in practice.
+    apiKey: process.env.UNIPILE_API_KEY || '',
     dsn: process.env.UNIPILE_DSN || '',
     get apiUrl() {
       return this.dsn.startsWith('http') ? this.dsn : `https://${this.dsn}`;
