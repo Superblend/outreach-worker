@@ -36,9 +36,28 @@ export function stopPollFallback(): void {
 
 async function runPollCycle(onWake: WakeHandler): Promise<void> {
   try {
-    // Find sequences with due executions for clients in shadow/orchestrator
-    // mode that haven't been touched recently. We don't try to be clever —
-    // we wake every eligible sequence and let the scheduler decide.
+    // Two-step query — PostgREST can't auto-resolve a deep
+    // executions → sequences → clients nested embed, so we do the client
+    // filter as a separate lookup. Both steps are individually cheap and
+    // well-indexed.
+    //
+    // Step 1: which clients are in shadow or orchestrator mode?
+    const { data: eligibleClients, error: clientsErr } = await supabase
+      .from('clients')
+      .select('id')
+      .in('orchestrator_mode', ['shadow', 'orchestrator']);
+
+    if (clientsErr) {
+      console.error('[poll] eligible-clients lookup failed:', clientsErr.message);
+      return;
+    }
+    if (!eligibleClients || eligibleClients.length === 0) {
+      // Nothing to do — every client is on legacy mode.
+      return;
+    }
+    const clientIds = eligibleClients.map((c) => c.id);
+
+    // Step 2: due executions for sequences owned by those clients.
     const fifteenMinAgo = new Date(Date.now() - 15 * 60_000).toISOString();
     const nowIso = new Date().toISOString();
 
@@ -46,17 +65,12 @@ async function runPollCycle(onWake: WakeHandler): Promise<void> {
       .from('unipile_sequence_executions')
       .select(`
         unipile_sequence_id,
-        unipile_sequences!inner(
-          client_id,
-          status,
-          use_bullmq,
-          clients!inner(orchestrator_mode)
-        )
+        unipile_sequences!inner(client_id, status, use_bullmq)
       `)
       .eq('status', 'running')
       .eq('unipile_sequences.status', 'active')
       .eq('unipile_sequences.use_bullmq', true)
-      .in('unipile_sequences.clients.orchestrator_mode', ['shadow', 'orchestrator'])
+      .in('unipile_sequences.client_id', clientIds)
       .lte('next_execution_at', nowIso)
       .lt('updated_at', fifteenMinAgo)
       .limit(2000);
