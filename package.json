@@ -3,9 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --outdir=dist --format=cjs --packages=external",
+    "build": "esbuild src/index.ts src/orchestrator/index.ts --bundle --platform=node --outdir=dist --format=cjs --packages=external --outbase=src",
     "start": "node dist/index.js",
+    "start:orchestrator": "node dist/orchestrator/index.js",
     "dev": "tsx watch src/index.ts",
+    "dev:orchestrator": "tsx watch src/orchestrator/index.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },

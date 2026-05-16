@@ -90,6 +90,13 @@ async function scanAndEnqueue() {
   // Pass 2 — all due now (remaining budget, deduped against Pass 1)
   const seenIds = new Set((overdueRows || []).map((e: any) => e.id));
   const pass2Limit = config.scanLimit - (overdueRows?.length || 0);
+  // ORCHESTRATOR MIGRATION (do not enable yet): once the orchestrator service
+  // is deployed and `clients.orchestrator_mode` column exists, both queries
+  // here need `.neq('unipile_sequences.clients.orchestrator_mode', 'orchestrator')`
+  // added via a `clients!inner(orchestrator_mode)` join, so the scanner stops
+  // double-dispatching for clients the orchestrator now owns. Coordinate this
+  // change with the migration deployment — adding it before the column exists
+  // makes this query throw and breaks all use_bullmq=true dispatch.
   const { data: generalRows, error: generalErr } = await supabase
     .from('unipile_sequence_executions')
     .select(EXECUTION_SELECT)
