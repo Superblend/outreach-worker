@@ -36,9 +36,9 @@ export function stopPollFallback(): void {
 
 async function runPollCycle(onWake: WakeHandler): Promise<void> {
   try {
-    // Two-step query — PostgREST can't auto-resolve a deep
+    // Three-step query — PostgREST can't auto-resolve a deep
     // executions → sequences → clients nested embed, so we do the client
-    // filter as a separate lookup. Both steps are individually cheap and
+    // filter as a separate lookup. Each step is individually cheap and
     // well-indexed.
     //
     // Step 1: which clients are in shadow or orchestrator mode?
@@ -57,11 +57,30 @@ async function runPollCycle(onWake: WakeHandler): Promise<void> {
     }
     const clientIds = eligibleClients.map((c) => c.id);
 
+    // Dedupe per sequence across both phases — one wake per sequence per cycle.
+    const seen = new Set<string>();
+    const wakeSequence = async (seqId: string, clientId: string): Promise<void> => {
+      if (!seqId || seen.has(seqId)) return;
+      seen.add(seqId);
+      const event: OrchSequenceWakeEvent = {
+        source: 'poll-fallback',
+        sequenceId: seqId,
+        clientId,
+        observedAt: new Date().toISOString(),
+      };
+      try {
+        await onWake(event);
+      } catch (err) {
+        console.error(`[poll] handler error for sequence=${seqId}:`, err);
+      }
+    };
+
     // Step 2: due executions for sequences owned by those clients.
+    //   Catches sequences with overdue work that Realtime missed.
     const fifteenMinAgo = new Date(Date.now() - 15 * 60_000).toISOString();
     const nowIso = new Date().toISOString();
 
-    const { data, error } = await supabase
+    const { data: dueRows, error: dueErr } = await supabase
       .from('unipile_sequence_executions')
       .select(`
         unipile_sequence_id,
@@ -75,36 +94,45 @@ async function runPollCycle(onWake: WakeHandler): Promise<void> {
       .lt('updated_at', fifteenMinAgo)
       .limit(2000);
 
-    if (error) {
-      console.error('[poll] cycle query failed:', error.message);
-      return;
-    }
-    if (!data || data.length === 0) return;
-
-    // Dedupe per sequence — one wake per sequence per cycle.
-    const seen = new Set<string>();
-    for (const row of data) {
-      const seqId = row.unipile_sequence_id;
-      if (!seqId || seen.has(seqId)) continue;
-      seen.add(seqId);
-
-      const sequence = (row as unknown as { unipile_sequences?: { client_id?: string } }).unipile_sequences;
-      const clientId = sequence?.client_id ?? '';
-
-      const event: OrchSequenceWakeEvent = {
-        source: 'poll-fallback',
-        sequenceId: seqId,
-        clientId,
-        observedAt: new Date().toISOString(),
-      };
-      try {
-        await onWake(event);
-      } catch (err) {
-        console.error(`[poll] handler error for sequence=${seqId}:`, err);
+    if (dueErr) {
+      console.error('[poll] due-executions query failed:', dueErr.message);
+    } else if (dueRows) {
+      for (const row of dueRows) {
+        const sequence = (row as unknown as { unipile_sequences?: { client_id?: string } }).unipile_sequences;
+        await wakeSequence(row.unipile_sequence_id, sequence?.client_id ?? '');
       }
     }
+    const dueWokenCount = seen.size;
 
-    console.log(`[poll] fallback cycle: ${seen.size} sequences woken`);
+    // Step 3: every active orchestrator-mode sequence, regardless of whether
+    // anything is due right now. This closes the gap where new contacts get
+    // added to an existing source list mid-day on an otherwise-idle sequence
+    // — `contacts` isn't in our Realtime subscription, so without this nudge
+    // the new contact wouldn't be pulled until the next bit of activity. The
+    // wake handler's window check + 30s pull cooldown make these cheap for
+    // sequences that have nothing new to do.
+    const { data: activeSeqs, error: seqsErr } = await supabase
+      .from('unipile_sequences')
+      .select('id, client_id')
+      .eq('status', 'active')
+      .eq('use_bullmq', true)
+      .in('client_id', clientIds);
+
+    if (seqsErr) {
+      console.error('[poll] active-sequences lookup failed:', seqsErr.message);
+    } else if (activeSeqs) {
+      for (const seq of activeSeqs) {
+        await wakeSequence(seq.id, seq.client_id);
+      }
+    }
+    const capacityWokenCount = seen.size - dueWokenCount;
+
+    if (seen.size > 0) {
+      console.log(
+        `[poll] fallback cycle: ${seen.size} sequences woken ` +
+          `(due=${dueWokenCount}, capacity-sweep=${capacityWokenCount})`,
+      );
+    }
   } catch (err) {
     console.error('[poll] cycle crashed:', err);
   }
