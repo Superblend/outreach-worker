@@ -151,10 +151,6 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
 
   // 4. Fetch due executions for this sequence.
   const candidates = await fetchDueExecutions(seq.id);
-  if (candidates.length === 0) {
-    console.log(`[scheduler] wake sequence=${seq.id} mode=${mode} due=0 source=${event.source}`);
-    return;
-  }
 
   // 5. Sort by cohort priority (ascending — lower number = higher priority).
   //    Mirrors scanner.ts's cohortPriority() exactly so shadow comparisons
@@ -171,6 +167,10 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
     `[scheduler] wake sequence=${seq.id} mode=${mode} due=${sorted.length} ` +
       `slotsUsed=${slotsUsed}/${dailyBudget} source=${event.source}`,
   );
+
+  // If nothing's due, skip the cohort loop but STILL run the new-lead pull
+  // below — a fresh sequence with zero executions needs the pull to bootstrap
+  // its first day. (Earlier version had an early return here that broke that.)
 
   // 6. Iterate candidates in cohort order. For each, decide slot need,
   //    claim if necessary, emit decision.
