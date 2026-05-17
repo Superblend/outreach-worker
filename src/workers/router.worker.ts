@@ -148,7 +148,12 @@ export function startRouterWorker(): Worker {
           ? executionQueue
           : getAccountQueue(targetQueueName);
 
-      const destJobId = `exec-${execution_id}-${step_id}-${ROUTER_SESSION_ID}`;
+      // Fresh per-dispatch nonce so BullMQ jobId dedup doesn't silently drop
+      // legitimate re-routes for an execution that was previously refused by
+      // the worker's daily-cap RPC. Worker's stale-job check on
+      // `unipile_step_results` is the actual duplicate-send protection.
+      const dispatchNonce = randomBytes(3).toString('hex');
+      const destJobId = `exec-${execution_id}-${step_id}-${ROUTER_SESSION_ID}-${dispatchNonce}`;
       const groupKey =
         channel === 'linkedin'
           ? `linkedin:${exec.assigned_linkedin_account_id || 'unknown'}`

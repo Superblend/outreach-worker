@@ -668,7 +668,18 @@ async function enqueueExecution(
   decision: OrchDecision,
   _candidate: ExecutionCandidate,
 ): Promise<void> {
-  const jobId = `exec-${decision.executionId}-${decision.stepId}-${ORCH_SESSION_ID}`;
+  // Fresh nonce per dispatch — prevents BullMQ jobId dedup from silently
+  // dropping legitimate re-enqueues (e.g., when an execution was previously
+  // refused by the daily-cap RPC, "completed" the BullMQ job without sending,
+  // and is now eligible again after the counter rolled over or an admin
+  // manually rescheduled it).
+  //
+  // Worker's stale-job check on `unipile_step_results` is the actual
+  // duplicate-send protection — it runs BEFORE the Unipile call regardless
+  // of jobId. So jobId uniqueness here is purely about queue admittance,
+  // not send safety.
+  const dispatchNonce = randomBytes(3).toString('hex');
+  const jobId = `exec-${decision.executionId}-${decision.stepId}-${ORCH_SESSION_ID}-${dispatchNonce}`;
 
   try {
     await dispatchPendingQueue.add(
