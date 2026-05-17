@@ -289,8 +289,123 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
   //    Shadow mode never pulls — creating real executions would defeat
   //    "observe only."
   if (mode === 'orchestrator') {
-    await pullNewLeadsForToday(seq, slotsAvailable, localDate);
+    // Backfill safety net: release slots for leads that went terminal
+    // (completed/failed) without ever making a send attempt — e.g., a
+    // conditional-check skip ("already connected on LinkedIn"), missing
+    // email, enrichment failure. Without this, those slots stay claimed
+    // and the day's batch under-delivers.
+    const released = await reconcileSoftFailedSlots(seq, localDate);
+    let slotsAvailableForPull = slotsAvailable;
+    if (released > 0) {
+      const slotsUsedAfter = await countSlotsForDate(seq.id, localDate);
+      slotsAvailableForPull = Math.max(0, dailyBudget - slotsUsedAfter);
+      console.log(
+        `[scheduler] sequence=${seq.id} reconciled ${released} soft-failed slots ` +
+          `→ slotsAvailable ${slotsAvailable}→${slotsAvailableForPull}`,
+      );
+    }
+    await pullNewLeadsForToday(seq, slotsAvailableForPull, localDate);
   }
+}
+
+/**
+ * Release slots that were claimed for leads which subsequently went terminal
+ * (status='completed' or 'failed') without the worker ever attempting a send.
+ *
+ * "Attempted a send" is defined as a row existing in `unipile_step_results`
+ * for the execution. The worker writes that row when it calls the provider
+ * (Unipile), regardless of outcome — success, 4xx, 5xx, bounce all leave a
+ * trail. So "no row" = "we never tried."
+ *
+ * This intentionally handles only soft pre-send failures:
+ *
+ *   Released (slot freed, backfill kicks in):
+ *     - Conditional-check skip ("already connected on LinkedIn" → completed)
+ *     - Lead has no email / no LinkedIn URL (worker marks failed before send)
+ *     - Enrichment / lookup failure before the provider call
+ *
+ *   NOT released (slot stays claimed):
+ *     - Provider 4xx/5xx after send attempt → step_results row exists
+ *     - Bounce after delivery → step_results row exists
+ *     - Daily account cap hit → execution stays `running`, not terminal
+ *     - Multi-day follow-ups → first_touch_done=true, never claimed a slot
+ *
+ * Cheap: three small queries gated by today's slot set (capped at
+ * daily_batch_size, typically dozens to a few hundred rows).
+ */
+async function reconcileSoftFailedSlots(
+  seq: SequenceMeta,
+  localDate: string,
+): Promise<number> {
+  // 1. Today's claimed slots for this sequence.
+  const { data: slots, error: slotErr } = await supabase
+    .from('unipile_sequence_daily_leads')
+    .select('contact_id')
+    .eq('unipile_sequence_id', seq.id)
+    .eq('date', localDate);
+  if (slotErr) {
+    console.error(`[reconcile] slot read failed sequence=${seq.id}: ${slotErr.message}`);
+    return 0;
+  }
+  if (!slots || slots.length === 0) return 0;
+
+  const contactIds = (slots as Array<{ contact_id: string }>).map((s) => s.contact_id);
+
+  // 2. Terminal executions on these contacts that never first-touched.
+  //    Anything still `running` is by definition not a soft failure.
+  const { data: execs, error: execErr } = await supabase
+    .from('unipile_sequence_executions')
+    .select('id, contact_id')
+    .eq('unipile_sequence_id', seq.id)
+    .in('contact_id', contactIds)
+    .in('status', ['completed', 'failed'])
+    .eq('first_touch_done', false);
+  if (execErr) {
+    console.error(`[reconcile] exec read failed sequence=${seq.id}: ${execErr.message}`);
+    return 0;
+  }
+  if (!execs || execs.length === 0) return 0;
+
+  const execRows = execs as Array<{ id: string; contact_id: string }>;
+  const execIds = execRows.map((e) => e.id);
+
+  // 3. Step-result existence check. Only executions with ZERO step_results
+  //    are eligible for slot release — anything else means the worker
+  //    actually called the provider and consumed real send budget.
+  const { data: attempts, error: attemptsErr } = await supabase
+    .from('unipile_step_results')
+    .select('execution_id')
+    .in('execution_id', execIds);
+  if (attemptsErr) {
+    console.error(
+      `[reconcile] step_results read failed sequence=${seq.id}: ${attemptsErr.message}`,
+    );
+    return 0;
+  }
+  const attemptedExecIds = new Set(
+    (attempts ?? []).map((a) => (a as { execution_id: string }).execution_id),
+  );
+
+  const contactsToRelease = execRows
+    .filter((e) => !attemptedExecIds.has(e.id))
+    .map((e) => e.contact_id);
+
+  if (contactsToRelease.length === 0) return 0;
+
+  // 4. Delete the slot rows. The contacts stay in `unipile_sequence_executions`
+  //    in their terminal state — we just stop counting them against today's
+  //    fresh-start quota so the pull can backfill with replacement contacts.
+  const { error: delErr } = await supabase
+    .from('unipile_sequence_daily_leads')
+    .delete()
+    .eq('unipile_sequence_id', seq.id)
+    .eq('date', localDate)
+    .in('contact_id', contactsToRelease);
+  if (delErr) {
+    console.error(`[reconcile] slot release failed sequence=${seq.id}: ${delErr.message}`);
+    return 0;
+  }
+  return contactsToRelease.length;
 }
 
 /**
