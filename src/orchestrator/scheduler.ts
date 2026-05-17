@@ -449,8 +449,6 @@ async function pullNewLeadsForToday(
   const sourceListId = isContactBased ? seq.contact_list_id : seq.lead_list_id;
   if (!sourceListId) return; // no source list — sequence misconfigured
 
-  const sourceTable = isContactBased ? 'contacts' : 'leads';
-  const sourceListColumn = isContactBased ? 'contact_list_id' : 'lead_list_id';
   const idColumn: 'contact_id' | 'lead_id' = isContactBased ? 'contact_id' : 'lead_id';
 
   // 1. Fetch first step of the sequence.
@@ -464,37 +462,27 @@ async function pullNewLeadsForToday(
   if (!firstStepData) return;
   const firstStepId = (firstStepData as { id: string }).id;
 
-  // 2. Fetch contacts in this sequence that already have an execution.
-  //    (Plain insert + ON CONFLICT can't target the partial unique indexes,
-  //    so we filter client-side. This is the same approach
-  //    `unipile-process-batch-queue` uses.)
-  const { data: existing, error: existingErr } = await supabase
-    .from('unipile_sequence_executions')
-    .select(idColumn)
-    .eq('unipile_sequence_id', seq.id)
-    .not(idColumn, 'is', null);
-  if (existingErr) {
-    console.error(`[pull] existing-execs query failed for sequence=${seq.id}:`, existingErr.message);
-    return;
+  // 2. Pull unassigned candidates via Postgres RPC.
+  //    The RPC does the anti-join (`NOT EXISTS` against
+  //    unipile_sequence_executions) server-side, which keeps the query
+  //    O(log n) on existing-execution count via `idx_executions_contact_id` /
+  //    `idx_executions_lead_id`. The previous client-side approach (fetch all
+  //    existing IDs then send them back as a `NOT IN (...)` URL literal)
+  //    failed at ~5k+ leads per sequence due to PostgREST URL limits.
+  const rpcName = isContactBased ? 'orch_pull_unassigned_contacts' : 'orch_pull_unassigned_leads';
+  const rpcArgs: Record<string, unknown> = {
+    p_sequence_id: seq.id,
+    p_limit: slotsAvailable,
+  };
+  if (isContactBased) {
+    rpcArgs.p_contact_list_id = sourceListId;
+  } else {
+    rpcArgs.p_lead_list_id = sourceListId;
   }
-  const existingIds = (existing ?? []).map((r) => (r as Record<string, string | null>)[idColumn]).filter(Boolean) as string[];
 
-  // 3. Query the source list for contacts not yet started. Bounded by
-  //    slotsAvailable so we never overshoot the daily budget.
-  let pullQuery = supabase
-    .from(sourceTable)
-    .select('id')
-    .eq(sourceListColumn, sourceListId)
-    .limit(slotsAvailable);
-  if (existingIds.length > 0) {
-    // PostgREST `not.in` accepts a `(uuid1,uuid2,...)` literal. For very large
-    // exclusion lists this could grow URL length — at typical campaign sizes
-    // (a few thousand existing executions) it's still well within limits.
-    pullQuery = pullQuery.not('id', 'in', `(${existingIds.join(',')})`);
-  }
-  const { data: newContacts, error: pullErr } = await pullQuery;
+  const { data: newContacts, error: pullErr } = await supabase.rpc(rpcName, rpcArgs);
   if (pullErr) {
-    console.error(`[pull] source query failed for sequence=${seq.id}:`, pullErr.message);
+    console.error(`[pull] RPC ${rpcName} failed for sequence=${seq.id}:`, pullErr.message);
     return;
   }
   if (!newContacts || newContacts.length === 0) return;
@@ -566,7 +554,7 @@ async function pullNewLeadsForToday(
   // Cooldown was already set at function entry. Just log the result.
   console.log(
     `[pull] sequence=${seq.id} pulled ${newContacts.length} new contacts ` +
-      `(slotsAvailable was ${slotsAvailable}, source=${sourceTable})`,
+      `(slotsAvailable was ${slotsAvailable}, source=${isContactBased ? 'contacts' : 'leads'})`,
   );
 }
 
