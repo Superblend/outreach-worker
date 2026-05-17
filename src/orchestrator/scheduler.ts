@@ -21,7 +21,7 @@
  */
 
 import { randomBytes } from 'crypto';
-import { supabase, invokeEdgeFunction } from '../supabase';
+import { supabase } from '../supabase';
 import { isWithinActiveWindow } from '../lib/time-utils';
 import { dispatchPendingQueue } from '../queues/definitions';
 import { getOrchestratorMode } from './mode-reader';
@@ -241,67 +241,207 @@ export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<voi
       (dailyLimitReached ? ' (daily_limit_reached during pass)' : ''),
   );
 
-  // 7. New-lead materialization: if there are due batches sitting in
-  //    `unipile_batch_queue` for this sequence, ask the existing
-  //    `unipile-process-batch-queue` edge function to materialize them into
-  //    executions. The edge function already handles dedup, account rotation,
-  //    active-day filter, and INSERT shape — we just decide WHEN to trigger
-  //    it. Replaces the daily 09 UTC cron's role for orchestrator-mode clients.
+  // 7. Capacity-based new-lead pull. Replaces pre-batching entirely:
+  //    look at how many fresh-start slots remain for today
+  //    (daily_batch_size minus first-touches already started today), then
+  //    pull exactly that many contacts from the sequence's lead pool that
+  //    don't yet have an execution. INSERT them as first-touch executions.
   //
-  //    For shadow mode we don't materialize, because doing so would create
-  //    real executions that the legacy scanner would then dispatch — defeating
-  //    the "observe only" promise of shadow.
+  //    This is what makes daily release self-throttling — drift can't
+  //    compound because the pull is gated by actual slot consumption, not
+  //    by a calendar-scheduled batch. Same-day chains and multi-day
+  //    follow-ups dispatch normally above this step (they don't consume
+  //    slots, per the corrected slot semantics).
+  //
+  //    Shadow mode never pulls — creating real executions would defeat
+  //    "observe only."
   if (mode === 'orchestrator') {
-    await materializeDueBatches(seq);
+    await pullNewLeadsForToday(seq, slotsAvailable, localDate);
   }
 }
 
 /**
- * Trigger `unipile-process-batch-queue` if there are due batches for this
- * sequence and we haven't called it recently (per-sequence debouncer).
+ * Pull new contacts from the sequence's source list and materialize them
+ * as first-touch executions, capped at `slotsAvailable`.
  *
- * The edge function processes ALL due batches for the given client_id in one
- * pass. We invoke it per-client (not per-sequence) so a client with many
- * sequences only generates one invocation per cooldown window.
+ * Source detection: if the sequence has a `contact_list_id` use the
+ * `contacts` table; otherwise fall back to `lead_list_id` → `leads`.
+ *
+ * Account assignment: round-robin from the sequence's rotating account
+ * pools (`unipile_sequence_email_accounts`, `unipile_sequence_linkedin_accounts`)
+ * with fallback to `sequence.configuration.selectedEmailAccountId` /
+ * `selectedLinkedInAccountId`. Matches `unipile-process-batch-queue`'s
+ * pattern exactly so the worker's existing send path works unchanged.
+ *
+ * Debouncer reuses the same `lastMaterializeAt` map keyed per-sequence so
+ * back-to-back Realtime events don't issue parallel pulls for the same
+ * sequence.
  */
-async function materializeDueBatches(seq: SequenceMeta): Promise<void> {
-  const key = `client:${seq.client_id}`;
-  const last = lastMaterializeAt.get(key) ?? 0;
+async function pullNewLeadsForToday(
+  seq: SequenceMeta,
+  slotsAvailable: number,
+  localDate: string,
+): Promise<void> {
+  if (slotsAvailable <= 0) return;
+
+  // Per-sequence debouncer — different key from the legacy batch
+  // materializer's client-level one to avoid cross-contamination.
+  const cooldownKey = `pull:${seq.id}`;
   const now = Date.now();
+  const last = lastMaterializeAt.get(cooldownKey) ?? 0;
   if (now - last < MATERIALIZE_COOLDOWN_MS) return;
 
-  // Are there actually due batches for this sequence? Cheap pre-check so we
-  // don't invoke the edge function speculatively on every wake.
-  const { data: dueBatches, error } = await supabase
-    .from('unipile_batch_queue')
-    .select('id', { head: false })
-    .eq('unipile_sequence_id', seq.id)
-    .eq('status', 'pending')
-    .lte('scheduled_for', new Date().toISOString())
-    .limit(1);
+  // Decide source: contact-based vs lead-based sequence.
+  const isContactBased = !!seq.contact_list_id;
+  const sourceListId = isContactBased ? seq.contact_list_id : seq.lead_list_id;
+  if (!sourceListId) return; // no source list — sequence misconfigured
 
-  if (error) {
-    console.warn(`[orchestrator] materialize pre-check failed for sequence=${seq.id}:`, error.message);
+  const sourceTable = isContactBased ? 'contacts' : 'leads';
+  const sourceListColumn = isContactBased ? 'contact_list_id' : 'lead_list_id';
+  const idColumn: 'contact_id' | 'lead_id' = isContactBased ? 'contact_id' : 'lead_id';
+
+  // 1. Fetch first step of the sequence.
+  const { data: firstStepData } = await supabase
+    .from('unipile_sequence_steps')
+    .select('id')
+    .eq('unipile_sequence_id', seq.id)
+    .order('step_order', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (!firstStepData) return;
+  const firstStepId = (firstStepData as { id: string }).id;
+
+  // 2. Fetch contacts in this sequence that already have an execution.
+  //    (Plain insert + ON CONFLICT can't target the partial unique indexes,
+  //    so we filter client-side. This is the same approach
+  //    `unipile-process-batch-queue` uses.)
+  const { data: existing, error: existingErr } = await supabase
+    .from('unipile_sequence_executions')
+    .select(idColumn)
+    .eq('unipile_sequence_id', seq.id)
+    .not(idColumn, 'is', null);
+  if (existingErr) {
+    console.error(`[pull] existing-execs query failed for sequence=${seq.id}:`, existingErr.message);
     return;
   }
-  if (!dueBatches || dueBatches.length === 0) return;
+  const existingIds = (existing ?? []).map((r) => (r as Record<string, string | null>)[idColumn]).filter(Boolean) as string[];
 
-  // Mark cooldown BEFORE the call so concurrent wakes don't pile on.
-  lastMaterializeAt.set(key, now);
+  // 3. Query the source list for contacts not yet started. Bounded by
+  //    slotsAvailable so we never overshoot the daily budget.
+  let pullQuery = supabase
+    .from(sourceTable)
+    .select('id')
+    .eq(sourceListColumn, sourceListId)
+    .limit(slotsAvailable);
+  if (existingIds.length > 0) {
+    // PostgREST `not.in` accepts a `(uuid1,uuid2,...)` literal. For very large
+    // exclusion lists this could grow URL length — at typical campaign sizes
+    // (a few thousand existing executions) it's still well within limits.
+    pullQuery = pullQuery.not('id', 'in', `(${existingIds.join(',')})`);
+  }
+  const { data: newContacts, error: pullErr } = await pullQuery;
+  if (pullErr) {
+    console.error(`[pull] source query failed for sequence=${seq.id}:`, pullErr.message);
+    return;
+  }
+  if (!newContacts || newContacts.length === 0) return;
 
-  console.log(`[orchestrator] triggering batch materialization for client=${seq.client_id} (sequence ${seq.id} has due batches)`);
-  const { error: invokeErr } = await invokeEdgeFunction('unipile-process-batch-queue', {
-    client_id: seq.client_id,
+  // 4. Resolve rotating accounts for assignment.
+  const [emailAccounts, linkedInAccounts] = await Promise.all([
+    fetchRotatingAccounts(seq.id, 'email'),
+    fetchRotatingAccounts(seq.id, 'linkedin'),
+  ]);
+  const cfg = seq.configuration ?? {};
+  const fallbackEmail = cfg.selectedEmailAccountId ?? null;
+  const fallbackLinkedIn = cfg.selectedLinkedInAccountId ?? null;
+
+  // 5. Build execution rows. Match the shape produced by
+  //    unipile-process-batch-queue so the worker's existing send path
+  //    works unchanged.
+  const startedAtIso = new Date().toISOString();
+  const executions = newContacts.map((c, i) => {
+    const jitterSeconds = Math.floor(Math.random() * 60);
+    const nextExec = new Date(Date.now() + jitterSeconds * 1000).toISOString();
+    const assignedEmail =
+      emailAccounts.length > 0
+        ? emailAccounts[i % emailAccounts.length]
+        : fallbackEmail;
+    const assignedLinkedIn =
+      linkedInAccounts.length > 0
+        ? linkedInAccounts[i % linkedInAccounts.length]
+        : fallbackLinkedIn;
+    return {
+      unipile_sequence_id: seq.id,
+      [idColumn]: (c as { id: string }).id,
+      current_step_id: firstStepId,
+      status: 'running' as const,
+      started_at: startedAtIso,
+      next_execution_at: nextExec,
+      execution_state: 'not_started' as const,
+      priority_cohort: 'new_today' as const,
+      first_touch_done: false,
+      assigned_email_account_id: assignedEmail,
+      assigned_linkedin_account_id: assignedLinkedIn,
+    };
   });
 
-  if (invokeErr) {
-    console.error(`[orchestrator] batch materialization invoke failed for client=${seq.client_id}:`, invokeErr.message);
-    // Reset cooldown on failure so the next wake can retry sooner.
-    lastMaterializeAt.delete(key);
-  } else {
-    console.log(`[orchestrator] batch materialization completed for client=${seq.client_id}`);
+  // 6. Insert executions + claim slots in parallel.
+  const { error: insertErr } = await supabase
+    .from('unipile_sequence_executions')
+    .insert(executions);
+  if (insertErr) {
+    // Bulk insert is all-or-nothing — log and bail. The cooldown will
+    // back off the retry naturally; partial unique indexes catch any race.
+    console.error(`[pull] execution insert failed for sequence=${seq.id}:`, insertErr.message);
+    return;
   }
+
+  // Claim slots (best-effort — slot rows are tracking metadata, not
+  // gate-keepers at this point; insert above already committed).
+  const slotRows = newContacts.map((c) => ({
+    unipile_sequence_id: seq.id,
+    contact_id: (c as { id: string }).id, // slot table now keys on contact_id
+    date: localDate,
+  }));
+  await supabase
+    .from('unipile_sequence_daily_leads')
+    .upsert(slotRows, {
+      onConflict: 'unipile_sequence_id,contact_id,date',
+      ignoreDuplicates: true,
+    });
+
+  lastMaterializeAt.set(cooldownKey, now);
+  console.log(
+    `[pull] sequence=${seq.id} pulled ${newContacts.length} new contacts ` +
+      `(slotsAvailable was ${slotsAvailable}, source=${sourceTable})`,
+  );
 }
+
+/**
+ * Fetch the rotating account pool for a sequence. Returns the
+ * `unipile_account_id` strings ordered by `priority_order`.
+ */
+async function fetchRotatingAccounts(
+  sequenceId: string,
+  channel: 'email' | 'linkedin',
+): Promise<string[]> {
+  const tableName =
+    channel === 'email'
+      ? 'unipile_sequence_email_accounts'
+      : 'unipile_sequence_linkedin_accounts';
+  const { data, error } = await supabase
+    .from(tableName)
+    .select('unipile_account_id, priority_order')
+    .eq('unipile_sequence_id', sequenceId)
+    .eq('is_active', true)
+    .order('priority_order', { ascending: true });
+  if (error || !data) return [];
+  return data
+    .map((r) => (r as { unipile_account_id: string }).unipile_account_id)
+    .filter(Boolean);
+}
+
+// (materializeDueBatches removed — replaced by capacity-based pullNewLeadsForToday)
 
 // ---------------------------------------------------------------------------
 // Internals
@@ -317,6 +457,9 @@ interface SequenceMeta {
   scheduled_start_time: string | null;
   scheduled_end_time: string | null;
   active_days: number[] | null;
+  contact_list_id: string | null;
+  lead_list_id: string | null;
+  configuration: { selectedEmailAccountId?: string; selectedLinkedInAccountId?: string } | null;
 }
 
 interface ExecutionCandidate {
@@ -340,7 +483,8 @@ async function loadSequence(sequenceId: string): Promise<SequenceMeta | null> {
     .from('unipile_sequences')
     .select(
       'id, client_id, status, use_bullmq, timezone, daily_batch_size, ' +
-        'scheduled_start_time, scheduled_end_time, active_days',
+        'scheduled_start_time, scheduled_end_time, active_days, ' +
+        'contact_list_id, lead_list_id, configuration',
     )
     .eq('id', sequenceId)
     .maybeSingle();
