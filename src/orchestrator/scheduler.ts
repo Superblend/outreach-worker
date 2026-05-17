@@ -50,6 +50,21 @@ const ORCH_SESSION_ID = randomBytes(4).toString('hex');
 const lastMaterializeAt = new Map<string, number>();
 const MATERIALIZE_COOLDOWN_MS = 30_000;
 
+/**
+ * Per-sequence in-process lock. Realtime can deliver multiple events for the
+ * same sequence in rapid succession (e.g., a batch INSERT of 60 executions
+ * fires 60 events). Without serialization, each event spawns a parallel
+ * handleWakeEvent that:
+ *   - reads slotsUsed at wake-start (all see same stale value)
+ *   - dispatches the same execution rows in parallel
+ *   - pullNewLeadsForToday runs in parallel and over-pulls
+ *
+ * This Set holds the sequence_ids currently being processed. New wakes for
+ * a held sequence return immediately — the in-flight processor will pick up
+ * any new state via fetchDueExecutions, which queries fresh on each pass.
+ */
+const inFlightSequences = new Set<string>();
+
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
@@ -71,8 +86,26 @@ const MAX_CANDIDATES_PER_WAKE = 500;
 /**
  * Entry point called by the Realtime subscriber and poll fallback.
  * One call = one sequence considered.
+ *
+ * Serialized per sequence_id: if another wake for this sequence is already
+ * in flight, the new wake returns immediately. The in-flight processor will
+ * re-query fresh state at the top of its loop, so no work is missed; we just
+ * avoid parallel dispatchers double-claiming slots and double-pulling leads.
  */
 export async function handleWakeEvent(event: OrchSequenceWakeEvent): Promise<void> {
+  // Per-sequence serialization guard.
+  if (inFlightSequences.has(event.sequenceId)) {
+    return;
+  }
+  inFlightSequences.add(event.sequenceId);
+  try {
+    await _handleWakeEventInner(event);
+  } finally {
+    inFlightSequences.delete(event.sequenceId);
+  }
+}
+
+async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void> {
   // 1. Load sequence + client metadata.
   const seq = await loadSequence(event.sequenceId);
   if (!seq) return;
@@ -286,10 +319,15 @@ async function pullNewLeadsForToday(
 
   // Per-sequence debouncer — different key from the legacy batch
   // materializer's client-level one to avoid cross-contamination.
+  // Set the cooldown timestamp BEFORE any async work so parallel calls
+  // can't all sail past the check together (the original race that
+  // caused over-pulling in the 60→177 incident). The in-flight wake lock
+  // above is now the primary protection, but defense in depth.
   const cooldownKey = `pull:${seq.id}`;
   const now = Date.now();
   const last = lastMaterializeAt.get(cooldownKey) ?? 0;
   if (now - last < MATERIALIZE_COOLDOWN_MS) return;
+  lastMaterializeAt.set(cooldownKey, now);
 
   // Decide source: contact-based vs lead-based sequence.
   const isContactBased = !!seq.contact_list_id;
@@ -410,7 +448,7 @@ async function pullNewLeadsForToday(
       ignoreDuplicates: true,
     });
 
-  lastMaterializeAt.set(cooldownKey, now);
+  // Cooldown was already set at function entry. Just log the result.
   console.log(
     `[pull] sequence=${seq.id} pulled ${newContacts.length} new contacts ` +
       `(slotsAvailable was ${slotsAvailable}, source=${sourceTable})`,
