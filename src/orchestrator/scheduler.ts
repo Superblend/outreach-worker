@@ -290,6 +290,11 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
   let dispatchesThisWake = 0;
   let dailyLimitReached = false;
   let dispatchBudgetExhausted = false;
+  // Accounts that have already hit their per-(seq, account) in-flight cap
+  // during this wake. Tracked locally so we can cheaply skip subsequent
+  // candidates assigned to the same account without re-incrementing Redis
+  // or emitting a log line per candidate. Cleared when this wake ends.
+  const accountsAtCapThisWake = new Set<string>();
 
   for (const { exec, priority } of sorted) {
     const label = cohortLabelFromPriority(priority);
@@ -421,9 +426,23 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
       // can't dispatch sequence A's 31st job until sequence A's 1st job
       // completes (which the worker will do at its natural pace, mixing
       // it with whatever B has queued).
+      //
+      // Once a (sequence, account) hits cap, ALL subsequent candidates for
+      // THAT account will also be refused this wake — there's no point
+      // iterating + INCR/DECRing Redis hundreds of times per wake. Skip
+      // them quickly. We track per-account cap-hit in a local Set so a
+      // wake with mixed assigned accounts (round-robin pools) still
+      // gives each account a fair chance.
       if (channel && channelAccount) {
+        if (accountsAtCapThisWake.has(channelAccount)) {
+          // Already known cap-hit this wake — skip the Redis round-trip
+          // and the log line.
+          decisionsRecorded++;
+          continue;
+        }
         const reserved = await tryReserveDispatchSlot(channelAccount, seq.id);
         if (!reserved) {
+          accountsAtCapThisWake.add(channelAccount);
           await emitDecision(
             {
               sequenceId: seq.id,
