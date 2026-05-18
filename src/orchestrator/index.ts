@@ -20,9 +20,51 @@ import { startRealtimeSubscriber, isRealtimeHealthy, subscriberStats } from './r
 import { startPollFallback } from './poll-fallback';
 import { handleWakeEvent } from './scheduler';
 import { modeCacheStats } from './mode-reader';
-import { clearAllInflightCounters } from './dispatch-budget';
+import { clearAllInflightCounters, listInflightCounters, resetInflightCounter } from './dispatch-budget';
 
 const app = express();
+app.use(express.json());
+
+/**
+ * Admin: list current per-(account, sequence) in-flight dispatch counters.
+ * Useful for diagnosing stuck-counter situations where a sequence has
+ * dispatched 0 jobs despite being eligible — symptoms include orchestrator
+ * logs emitting `inflight_budget_full` for that sequence on every wake.
+ */
+app.get('/admin/dispatch-budget', async (_req, res) => {
+  try {
+    const rows = await listInflightCounters();
+    res.json({ ok: true, count: rows.length, counters: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+});
+
+/**
+ * Admin: clear a stuck in-flight counter for one (account, sequence) pair,
+ * or wipe all counters with `?all=1`. Used to recover from desync when the
+ * 24h TTL is too slow and a manual redeploy didn't restart the process.
+ *
+ * Counters re-INCR naturally on the next wake; this is safe.
+ */
+app.post('/admin/dispatch-budget/reset', async (req, res) => {
+  try {
+    if (req.query.all === '1') {
+      const n = await clearAllInflightCounters();
+      res.json({ ok: true, cleared: n });
+      return;
+    }
+    const { account_id, sequence_id } = req.body ?? {};
+    if (typeof account_id !== 'string' || typeof sequence_id !== 'string') {
+      res.status(400).json({ ok: false, error: 'account_id and sequence_id are required (or pass ?all=1)' });
+      return;
+    }
+    await resetInflightCounter(account_id, sequence_id);
+    res.json({ ok: true, reset: `${account_id}:${sequence_id}` });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+});
 
 app.get('/health', (_req, res) => {
   res.json({

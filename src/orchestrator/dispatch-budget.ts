@@ -114,6 +114,28 @@ export async function getInflightCount(
   return v ? Number(v) : 0;
 }
 
+/** Diagnostic: list all current inflight counters with their values. */
+export async function listInflightCounters(): Promise<{ key: string; count: number }[]> {
+  const stream = connection.scanStream({ match: 'dispatch:inflight:*', count: 200 });
+  const keys: string[] = [];
+  await new Promise<void>((resolve, reject) => {
+    stream.on('data', (batch: string[]) => keys.push(...batch));
+    stream.on('end', () => resolve());
+    stream.on('error', reject);
+  });
+  if (keys.length === 0) return [];
+  const values = await Promise.all(keys.map((k) => connection.get(k)));
+  return keys.map((k, i) => ({ key: k, count: values[i] ? Number(values[i]) : 0 }));
+}
+
+/** Admin: force a single counter to zero (or wipe the key entirely). */
+export async function resetInflightCounter(
+  acctId: string,
+  seqId: string,
+): Promise<void> {
+  await connection.del(key(acctId, seqId));
+}
+
 /**
  * Clear every `dispatch:inflight:*` key in Redis. Called on orchestrator
  * startup so we don't carry over orphan reservations from a previous
