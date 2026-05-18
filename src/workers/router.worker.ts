@@ -136,7 +136,26 @@ export function startRouterWorker(): Worker {
           channel = 'linkedin';
         }
       } else if (stepType === 'email') {
-        targetQueueName = `outreach-email-client-${client_id}`;
+        // Per-account email queue (Phase 2 architecture). One queue per
+        // sending account — same model LinkedIn already uses.
+        //
+        // Why this matters: the previous per-client model conflated every
+        // sending account belonging to one client into a single FIFO queue.
+        // A client with 5 connected mailboxes had effective throughput
+        // capped at ~17/min (one queue's pacing), instead of ~85/min (one
+        // pipe per mailbox). Per-account queues give each mailbox its own
+        // pipe and let multiple sequences sharing one account interleave
+        // via the orchestrator's per-wake dispatch budget.
+        //
+        // Fall back to shared `outreach-executions` if no email account is
+        // assigned — execution.worker can run the existing rotation logic
+        // or fail gracefully if no account is available.
+        const emailAccountId = exec.assigned_email_account_id;
+        if (emailAccountId) {
+          targetQueueName = `outreach-email-acct-${emailAccountId}`;
+        } else {
+          targetQueueName = 'outreach-executions';
+        }
         channel = 'email';
       } else {
         targetQueueName = 'outreach-executions';
@@ -158,7 +177,7 @@ export function startRouterWorker(): Worker {
         channel === 'linkedin'
           ? `linkedin:${exec.assigned_linkedin_account_id || 'unknown'}`
           : channel === 'email'
-            ? `email-client:${client_id}`
+            ? `email-acct:${exec.assigned_email_account_id || 'unknown'}`
             : `other:${execution_id}`;
 
       // 4. Re-enqueue to the destination queue. Same payload shape that

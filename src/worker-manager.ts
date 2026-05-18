@@ -101,10 +101,18 @@ class WorkerManager {
    * Scan Redis for outreach-linkedin-* and outreach-email-* queues that have pending jobs.
    * Uses SCAN (cursor-based) instead of KEYS so it works on managed Redis providers
    * (Upstash, Railway internal Redis) that disable the blocking KEYS command.
+   *
+   * Both `outreach-email-acct-*` (per-account, current model from Phase 2)
+   * and `outreach-email-client-*` (legacy per-client; kept for backward
+   * compatibility while pre-Phase-2 jobs still drain) are recognised.
    */
   private async scanActiveQueues(): Promise<Set<string>> {
     const found = new Set<string>();
-    const prefixes = ['bull:outreach-linkedin-', 'bull:outreach-email-client-'];
+    const prefixes = [
+      'bull:outreach-linkedin-',
+      'bull:outreach-email-acct-',
+      'bull:outreach-email-client-', // legacy, drains in-flight jobs only
+    ];
 
     for (const prefix of prefixes) {
       const pattern = `${prefix}*:id`;
@@ -127,8 +135,10 @@ class WorkerManager {
       }
 
       for (const key of keys) {
-        // Key format: bull:outreach-linkedin-{accountId}:id or bull:outreach-email-client-{clientId}:id
-        const match = key.match(/^bull:(outreach-(?:linkedin|email-client)-.+):id$/);
+        // Key format: bull:outreach-linkedin-{accountId}:id,
+        //             bull:outreach-email-acct-{accountId}:id,
+        //          or bull:outreach-email-client-{clientId}:id (legacy)
+        const match = key.match(/^bull:(outreach-(?:linkedin|email-acct|email-client)-.+):id$/);
         if (!match) {
           console.warn(`WorkerManager: unexpected key format skipped: ${key}`);
           continue;
@@ -179,7 +189,11 @@ class WorkerManager {
   /** Drain all per-account queues. Called on startup to clear stale session jobs. */
   async drainAllAccountQueues(): Promise<void> {
     let keys: string[] = [];
-    for (const prefix of ['bull:outreach-linkedin-', 'bull:outreach-email-client-']) {
+    for (const prefix of [
+      'bull:outreach-linkedin-',
+      'bull:outreach-email-acct-',
+      'bull:outreach-email-client-',
+    ]) {
       try {
         const batch = await this.scanKeys(`${prefix}*:id`);
         keys.push(...batch);
