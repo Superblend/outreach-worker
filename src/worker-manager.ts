@@ -268,6 +268,12 @@ function parseAccountQueue(
   if (queueName.startsWith('outreach-linkedin-')) {
     return { channel: 'linkedin', entityId: queueName.slice('outreach-linkedin-'.length) };
   }
+  // Phase 2: per-account email queues (preferred).
+  if (queueName.startsWith('outreach-email-acct-')) {
+    return { channel: 'email', entityId: queueName.slice('outreach-email-acct-'.length) };
+  }
+  // Legacy per-client email queue — kept so any in-flight pre-Phase-2 jobs
+  // still get a consumer until they drain.
   if (queueName.startsWith('outreach-email-client-')) {
     return { channel: 'email', entityId: queueName.slice('outreach-email-client-'.length) };
   }
