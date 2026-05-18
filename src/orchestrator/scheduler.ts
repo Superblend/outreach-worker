@@ -156,6 +156,16 @@ const inFlightSequences = new Set<string>();
 /** Max executions considered per wake event. Per-sequence, so small budget. */
 const MAX_CANDIDATES_PER_WAKE = 500;
 
+/**
+ * Max *actual* dispatches a single wake emits per sequence. Skip decisions
+ * (cap_reached, slot full, race) don't count. Tunes the trade-off between
+ * fairness (more wakes = better interleaving across sequences sharing an
+ * account) and orchestrator wake frequency. ~10 = ~35 sec of queue depth
+ * at 17 emails/min worker pacing, which is short enough for a second
+ * sequence on the same account to interleave its batch within a minute.
+ */
+const MAX_DISPATCHES_PER_WAKE = 10;
+
 // Note: orchestrator does NOT use scanner.ts's 30-second updated_at buffer.
 // That buffer protects scanner from cadence-based double-enqueue (15s loop).
 // The orchestrator runs reactively via Realtime / poll fallback, so the same
@@ -258,8 +268,27 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
 
   // 6. Iterate candidates in cohort order. For each, decide slot need,
   //    claim if necessary, emit decision.
+  //
+  // Dispatch budget: cap how many *actual* dispatches this wake emits.
+  // Without this, a sequence with 1000 due candidates would push 1000 jobs
+  // into the per-account BullMQ queue in one wake — when multiple sequences
+  // share an account, whoever woke first monopolises the FIFO queue and
+  // the others starve.
+  //
+  // Capping per wake forces dispatches to chunk over time: each step_result
+  // insert fires a Realtime UPDATE → the orchestrator wakes the sequence
+  // again → another batch of `MAX_DISPATCHES_PER_WAKE` jobs is emitted.
+  // Multiple sequences sharing one account each contribute a small batch
+  // per wake, so their jobs interleave in the queue and both make
+  // incremental progress.
+  //
+  // Skips (cap-reached, daily-limit-reached, slot-race) do NOT count
+  // against the budget — they're cheap shadow-log entries with no queue
+  // impact.
   let decisionsRecorded = 0;
+  let dispatchesThisWake = 0;
   let dailyLimitReached = false;
+  let dispatchBudgetExhausted = false;
 
   for (const { exec, priority } of sorted) {
     const label = cohortLabelFromPriority(priority);
@@ -393,11 +422,24 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
       exec,
     );
     decisionsRecorded++;
+    dispatchesThisWake++;
+
+    // Stop after the budget is spent. Remaining candidates stay in
+    // `running, not_started` with their existing next_execution_at — the
+    // next Realtime wake (triggered by any of this wake's dispatches
+    // completing and writing a step_result) picks them up. Multiple
+    // sequences sharing an account take turns at this granularity.
+    if (dispatchesThisWake >= MAX_DISPATCHES_PER_WAKE) {
+      dispatchBudgetExhausted = true;
+      break;
+    }
   }
 
   console.log(
-    `[scheduler] sequence=${seq.id} mode=${mode} decisions=${decisionsRecorded}` +
-      (dailyLimitReached ? ' (daily_limit_reached during pass)' : ''),
+    `[scheduler] sequence=${seq.id} mode=${mode} decisions=${decisionsRecorded} ` +
+      `dispatched=${dispatchesThisWake}` +
+      (dailyLimitReached ? ' (daily_limit_reached during pass)' : '') +
+      (dispatchBudgetExhausted ? ' (dispatch_budget_exhausted — waiting for next wake)' : ''),
   );
 
   // 7. Capacity-based new-lead pull. Replaces pre-batching entirely:
