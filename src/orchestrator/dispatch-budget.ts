@@ -25,16 +25,25 @@ import { connection } from '../queues/definitions';
 
 /**
  * Maximum number of jobs from one sequence allowed in one account's BullMQ
- * queue at any moment. Tuned for:
- *   - per-account email worker pacing (~17/min) means 30 jobs ≈ 100 sec
- *     of queue runway per sequence, comfortably above the orchestrator's
- *     30s pull cooldown so we never deadlock
- *   - small enough that 5 sequences on one account = 150 max queue depth,
- *     low BullMQ overhead
- *   - large enough to absorb a wake's full batch (MAX_DISPATCHES_PER_WAKE = 10)
- *     three times before saturating
+ * queue at any moment.
+ *
+ * Lower values give better fairness across sequences sharing one account.
+ * The mechanism: worker drains the per-account queue FIFO; when a job
+ * completes the orchestrator wakes and refills *to the back* of the
+ * queue. A small cap means each sequence's burst occupies a short
+ * window in the queue before the next sequence's chunk takes over.
+ *
+ * Tuning at cap=10 with 17/min worker pacing:
+ *   - 10 jobs per sequence ≈ 35 sec of queue runway
+ *   - 3 sequences sharing an account → ~30-job rotating queue → full
+ *     round-robin cycle every ~1.7 min
+ *   - Much higher and one sequence with a head-start can dominate the
+ *     FIFO front for many minutes (see staging stress-test of 3
+ *     staggered campaigns where cap=30 starved campaign C for >9 min)
+ *   - Much lower (e.g. 3) risks underutilising the worker if wake
+ *     events lag the queue drain, leaving brief idle windows
  */
-const MAX_INFLIGHT_PER_SEQ_PER_ACCT = 30;
+const MAX_INFLIGHT_PER_SEQ_PER_ACCT = 10;
 
 const TTL_SECONDS = 86_400; // 24h safety expiry: abandoned counters reset daily
 
