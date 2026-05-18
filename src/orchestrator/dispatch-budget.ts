@@ -58,6 +58,16 @@ export async function tryReserveDispatchSlot(
   if (count > MAX_INFLIGHT_PER_SEQ_PER_ACCT) {
     // Over the cap. Undo and refuse.
     await connection.decr(k);
+    // Log once every ~100 refusals per (account, sequence) so we can spot
+    // counter desync without flooding logs. Modulo on the raw INCR'd count
+    // gives us a sparse heartbeat.
+    if (count % 100 === 0) {
+      console.warn(
+        `[dispatch-budget] persistent refusal acct=${acctId} seq=${seqId} count=${count} (cap=${MAX_INFLIGHT_PER_SEQ_PER_ACCT}). ` +
+          `If sequence isn't sending, worker may have crashed mid-flight or counter is desynced; ` +
+          `key expires in <=${TTL_SECONDS}s.`,
+      );
+    }
     return false;
   }
   if (count === 1) {
@@ -93,6 +103,41 @@ export async function getInflightCount(
 ): Promise<number> {
   const v = await connection.get(key(acctId, seqId));
   return v ? Number(v) : 0;
+}
+
+/**
+ * Clear every `dispatch:inflight:*` key in Redis. Called on orchestrator
+ * startup so we don't carry over orphan reservations from a previous
+ * process that crashed mid-dispatch (orchestrator INCRs the counter
+ * before the BullMQ enqueue completes, so a crash window can leak
+ * reservations that nothing will ever release).
+ *
+ * Brief side-effect: real in-flight jobs from the previous orchestrator
+ * session still exist in BullMQ; when they complete the worker calls
+ * releaseDispatchSlot, which is a clamped DECR (won't go below zero) —
+ * harmless. Worst case is a few seconds of slightly over-dispatch
+ * before the new counter values catch up to reality, which is well
+ * within the cap's design tolerance.
+ */
+export async function clearAllInflightCounters(): Promise<number> {
+  const stream = connection.scanStream({ match: 'dispatch:inflight:*', count: 200 });
+  let total = 0;
+  return new Promise<number>((resolve, reject) => {
+    stream.on('data', async (keys: string[]) => {
+      if (keys.length === 0) return;
+      stream.pause();
+      try {
+        await connection.del(...keys);
+        total += keys.length;
+      } catch (err) {
+        stream.destroy(err as Error);
+        return;
+      }
+      stream.resume();
+    });
+    stream.on('end', () => resolve(total));
+    stream.on('error', reject);
+  });
 }
 
 /** Tunable for tests / future scale work. */

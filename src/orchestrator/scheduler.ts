@@ -27,7 +27,7 @@ import { dispatchPendingQueue } from '../queues/definitions';
 import { getOrchestratorMode } from './mode-reader';
 import { countSlotsForDate, hasSlot, claimSlot, todayInSequenceTz } from './slot-manager';
 import { recordShadowDecision } from './shadow-logger';
-import { tryReserveDispatchSlot } from './dispatch-budget';
+import { tryReserveDispatchSlot, releaseDispatchSlot } from './dispatch-budget';
 import type {
   OrchCohortLabel,
   OrchDecision,
@@ -979,7 +979,7 @@ async function emitDecision(
  */
 async function enqueueExecution(
   decision: OrchDecision,
-  _candidate: ExecutionCandidate,
+  candidate: ExecutionCandidate,
 ): Promise<void> {
   // Fresh nonce per dispatch — prevents BullMQ jobId dedup from silently
   // dropping legitimate re-enqueues (e.g., when an execution was previously
@@ -1024,6 +1024,28 @@ async function enqueueExecution(
     console.error(
       `[orchestrator] dispatch enqueue failed exec=${decision.executionId}: ${msg}`,
     );
+    // BullMQ add failed — the in-flight slot was reserved upstream in the
+    // cohort loop but no worker will ever release it (no job to release
+    // from). Roll back the reservation so the counter stays accurate.
+    // Mirrors the channelAccount derivation from the cohort loop's
+    // pre-flight cap check.
+    const rawStep = candidate.unipile_sequence_steps;
+    const stepData = Array.isArray(rawStep) ? rawStep[0] : rawStep;
+    const channel = capChannelForStep(stepData?.step_type ?? null);
+    const channelAccount =
+      channel === 'email'
+        ? candidate.assigned_email_account_id
+        : channel === 'linkedin_invitation' || channel === 'linkedin_message'
+          ? candidate.assigned_linkedin_account_id
+          : null;
+    if (channelAccount) {
+      try {
+        await releaseDispatchSlot(channelAccount, decision.sequenceId);
+      } catch {
+        // best-effort rollback; the 24h TTL on the counter key is the
+        // last-line safety net if this also fails
+      }
+    }
   }
 }
 
