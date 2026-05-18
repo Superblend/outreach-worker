@@ -77,7 +77,9 @@ export type OrchSkipReason =
   /** Client's `orchestrator_mode` is `legacy` (we shouldn't even be here) */
   | 'client_legacy_mode'
   /** Sequence is the legacy `use_bullmq=false` path */
-  | 'not_bullmq_sequence';
+  | 'not_bullmq_sequence'
+  /** Assigned account is at its per-day cap; will be retried on next wake */
+  | 'account_cap_reached';
 
 /** Row shape for `unipile_sequence_daily_leads` slot reservation table. */
 export interface SlotRow {

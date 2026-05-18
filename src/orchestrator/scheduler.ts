@@ -51,6 +51,90 @@ const lastMaterializeAt = new Map<string, number>();
 const MATERIALIZE_COOLDOWN_MS = 30_000;
 
 /**
+ * Short-lived cap-read cache. The pre-flight cap check fires once per
+ * dispatch decision; without caching, a single wake on a sequence with N
+ * candidates would issue N DB reads against `account_daily_limits`. The
+ * cache collapses repeat reads for the same account inside one wake (and
+ * the next few wakes within the TTL window).
+ *
+ * 10s TTL is short enough that a cap raise or another sequence's send
+ * filling headroom shows up within seconds, but long enough that bursts
+ * of dispatch decisions read the DB at most once per account per cycle.
+ * The worker's atomic cap RPC is still the source of truth at send time,
+ * so a brief cache miss can't cause an actual overshoot.
+ */
+interface CapCacheEntry {
+  sent: number;
+  max: number;
+  expiresAt: number;
+}
+const CAP_CACHE_TTL_MS = 10_000;
+const capCache = new Map<string, CapCacheEntry>();
+
+type CapChannel = 'email' | 'linkedin_invitation' | 'linkedin_message';
+
+const LINKEDIN_INVITATION_TYPES = new Set(['linkedin_invitation']);
+const LINKEDIN_MESSAGE_TYPES = new Set([
+  'linkedin_message',
+  'linkedin_voice_note',
+  'linkedin_engage_post',
+  'linkedin_endorse',
+  'linkedin_profile_visit',
+]);
+
+function capChannelForStep(stepType: string | null | undefined): CapChannel | null {
+  if (!stepType) return null;
+  if (stepType === 'email') return 'email';
+  if (LINKEDIN_INVITATION_TYPES.has(stepType)) return 'linkedin_invitation';
+  if (LINKEDIN_MESSAGE_TYPES.has(stepType)) return 'linkedin_message';
+  return null; // delay, conditional — no cap, doesn't pre-flight
+}
+
+/**
+ * Returns true if the assigned account is at its per-day cap for this
+ * channel. Uses a 10s in-process cache to avoid re-reading the same account
+ * for every candidate in a wake.
+ *
+ * Fail-open: if the cap row is missing or the read errors, return false
+ * (i.e. let the worker make the decision atomically). The worker's RPC is
+ * the real gate; this check is just an optimization.
+ */
+async function accountAtCap(accountId: string, channel: CapChannel): Promise<boolean> {
+  const cacheKey = `${channel}:${accountId}`;
+  const now = Date.now();
+  const cached = capCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.sent >= cached.max && cached.max > 0;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const { sentCol, maxCol } = (() => {
+    if (channel === 'email') return { sentCol: 'emails_sent', maxCol: 'max_emails' };
+    if (channel === 'linkedin_invitation') return { sentCol: 'linkedin_invitations_sent', maxCol: 'max_linkedin_invitations' };
+    return { sentCol: 'linkedin_messages_sent', maxCol: 'max_linkedin_messages' };
+  })();
+
+  const { data, error } = await supabase
+    .from('account_daily_limits')
+    .select(`${sentCol}, ${maxCol}`)
+    .eq('account_id', accountId)
+    .eq('date', today)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[preflight] account_daily_limits read failed acct=${accountId}: ${error.message}`);
+    return false; // fail-open
+  }
+
+  const row = data as unknown as Record<string, number | null> | null;
+  const sent = row ? Number(row[sentCol] ?? 0) : 0;
+  const max = row ? Number(row[maxCol] ?? 0) : 0;
+
+  capCache.set(cacheKey, { sent, max, expiresAt: now + CAP_CACHE_TTL_MS });
+  return max > 0 && sent >= max;
+}
+
+/**
  * Per-sequence in-process lock. Realtime can deliver multiple events for the
  * same sequence in rapid succession (e.g., a batch INSERT of 60 executions
  * fires 60 events). Without serialization, each event spawns a parallel
@@ -248,6 +332,48 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
         continue;
       }
       slotsAvailable--;
+    }
+
+    // Pre-flight account-cap check (orchestrator-mode dispatch only).
+    // Skips obviously-going-to-fail sends without round-tripping the worker.
+    // The worker's atomic `check_and_increment_daily_limit` is still the
+    // source of truth at send time; this is purely an optimization that
+    // also keeps the orchestrator's view of "what we tried today" honest.
+    // We do NOT release any slot we just claimed — the campaign committed
+    // to this lead as today's first-touch; we just defer it until the cap
+    // frees up (handled by the worker's +jitter reschedule on the next try
+    // if dispatch does happen, or by the next wake if pre-flight skipped).
+    if (mode === 'orchestrator') {
+      const rawStep = exec.unipile_sequence_steps;
+      const stepData = Array.isArray(rawStep) ? rawStep[0] : rawStep;
+      const channel = capChannelForStep(stepData?.step_type ?? null);
+      const channelAccount =
+        channel === 'email'
+          ? exec.assigned_email_account_id
+          : channel === 'linkedin_invitation' || channel === 'linkedin_message'
+            ? exec.assigned_linkedin_account_id
+            : null;
+      if (channel && channelAccount && (await accountAtCap(channelAccount, channel))) {
+        await emitDecision(
+          {
+            sequenceId: seq.id,
+            clientId: seq.client_id,
+            contactId: subjectId,
+            executionId: exec.id,
+            stepId: exec.current_step_id,
+            cohortPriority: priority,
+            cohortLabel: label,
+            nextExecutionAt: exec.next_execution_at,
+            consumesSlot,
+            skipReason: 'account_cap_reached',
+          },
+          event,
+          mode,
+          exec,
+        );
+        decisionsRecorded++;
+        continue;
+      }
     }
 
     await emitDecision(

@@ -221,6 +221,53 @@ async function enforceTimeWindow(proposedTime: Date, sequence: any): Promise<Dat
   return convertToUTC(dateStr, startH, startM, timezone);
 }
 
+/**
+ * Cap-rejection reschedule: when the daily-cap RPC says "no", try again later
+ * TODAY if there's still room in the active window. Falls back to
+ * `smartReschedule` (next active day) only if we'd land outside today's
+ * window with the standard 15-min grace.
+ *
+ * Only used for `check_and_increment_daily_limit` rejections. Other reschedule
+ * reasons (window-out, inactive-day, permanent failure) keep their existing
+ * "push to tomorrow" path — that's still correct for them.
+ *
+ * Rationale: account caps can be raised mid-day, other senders sharing the
+ * account can free up headroom, etc. Pushing every cap-rejected exec to
+ * tomorrow morning meant mid-day cap raises only took effect the next day.
+ * Retrying +jitter keeps the execution eligible while the active window is
+ * still open; the orchestrator's pre-flight cap check is the cheap path that
+ * skips dispatch if the account is still at cap, so this doesn't create a
+ * busy-loop at the worker.
+ */
+async function capRetryReschedule(
+  execution: any,
+  accountId: string,
+  messageType: string,
+  defaultLimit: number,
+): Promise<string> {
+  const sequence = execution.unipile_sequences as any;
+  const timezone = sequence?.timezone || 'UTC';
+  const endTime = sequence?.scheduled_end_time;
+
+  // Random 5–15 minute backoff. Spreads concurrent retries across the window
+  // so we don't slam the cap RPC in a burst the moment one slot opens up.
+  const jitterMs = 5 * 60_000 + Math.random() * 10 * 60_000;
+  const candidate = new Date(Date.now() + jitterMs);
+
+  if (endTime) {
+    const [endH, endM] = endTime.split(':').map(Number);
+    const candidateMin = localMinutesOfDay(candidate, timezone);
+    const endMin = endH * 60 + endM;
+    // 15-min grace matches enforceTimeWindow's existing convention. Past that,
+    // there's no realistic chance of sending today — push to tomorrow.
+    if (candidateMin > endMin + 15) {
+      return smartReschedule(execution, accountId, messageType, defaultLimit);
+    }
+  }
+
+  return candidate.toISOString();
+}
+
 async function smartReschedule(
   execution: any,
   _accountId: string,
@@ -757,7 +804,11 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
       console.log(`📊 Daily limit check result for ${execution_id} (${messageType}): ${JSON.stringify(limitResult)}`);
 
       if (limitResult && !limitResult.allowed) {
-        const nextTime = await smartReschedule(execution, accountId, messageType, defaultLimit);
+        // Reschedule WITHIN today's active window if there's still time —
+        // an account-cap raise or another sequence freeing headroom can
+        // unblock these execs the same day. Falls through to "next active
+        // day" only if we'd land past the window's end-of-day grace.
+        const nextTime = await capRetryReschedule(execution, accountId, messageType, defaultLimit);
         await supabase.from('unipile_sequence_executions')
           .update({ next_execution_at: nextTime, updated_at: new Date().toISOString() })
           .eq('id', execution_id);
