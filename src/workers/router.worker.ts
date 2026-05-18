@@ -58,6 +58,7 @@ interface ExecutionRow {
   status: string;
   execution_state: string;
   current_step_id: string | null;
+  unipile_sequence_id: string;
   assigned_linkedin_account_id: string | null;
   assigned_email_account_id: string | null;
   unipile_sequence_steps:
@@ -77,7 +78,7 @@ export function startRouterWorker(): Worker {
       const { data, error } = await supabase
         .from('unipile_sequence_executions')
         .select(`
-          id, status, execution_state, current_step_id,
+          id, status, execution_state, current_step_id, unipile_sequence_id,
           assigned_linkedin_account_id, assigned_email_account_id,
           unipile_sequence_steps!unipile_sequence_executions_current_step_id_fkey(step_type)
         `)
@@ -182,6 +183,15 @@ export function startRouterWorker(): Worker {
 
       // 4. Re-enqueue to the destination queue. Same payload shape that
       //    execution.worker.ts already expects (matches scanner.ts output).
+      // `sequence_id` and `account_id` let the destination worker release
+      // the per-(sequence, account) in-flight dispatch budget counter on
+      // job completion without a DB round-trip.
+      const destAccountId =
+        channel === 'linkedin'
+          ? exec.assigned_linkedin_account_id ?? undefined
+          : channel === 'email'
+            ? exec.assigned_email_account_id ?? undefined
+            : undefined;
       await targetQueue.add(
         'execute-step',
         {
@@ -190,6 +200,8 @@ export function startRouterWorker(): Worker {
           channel,
           step_id,
           step_type: stepType,
+          sequence_id: exec.unipile_sequence_id,
+          account_id: destAccountId,
         },
         {
           attempts: 3,

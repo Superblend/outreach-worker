@@ -14,6 +14,20 @@ import { unipileFetch } from '../lib/unipile-fetch';
 import { engagePost } from '../lib/unipile-engage-post';
 import { BatchWriter } from '../lib/batch-db';
 import { isPhantomMessageResult, isLinkedInMessageFollowUp } from '../lib/linkedin-helpers';
+import { releaseDispatchSlot } from '../orchestrator/dispatch-budget';
+
+/** Release the in-flight dispatch budget slot if the job carries one. */
+async function releaseInflightSlot(data: any): Promise<void> {
+  const seqId = data?.sequence_id;
+  const acctId = data?.account_id;
+  if (typeof seqId === 'string' && typeof acctId === 'string' && seqId && acctId) {
+    try {
+      await releaseDispatchSlot(acctId, seqId);
+    } catch (err) {
+      console.warn('[dispatch-budget] release failed:', (err as Error).message);
+    }
+  }
+}
 
 interface ExecutionJobData {
   execution_id: string;
@@ -21,6 +35,11 @@ interface ExecutionJobData {
   channel: string;
   step_id?: string;   // current_step_id at enqueue time — used for freshness checks
   step_type?: string; // step type at enqueue time — gates pacing to outbound steps only
+  // Set by the router when enqueueing to a per-account queue. Lets the
+  // worker release the per-(account, sequence) in-flight dispatch budget
+  // counter on job completion without an extra DB read.
+  sequence_id?: string;
+  account_id?: string;
 }
 
 // Stable per-process session ID — rotates on restart so pacing-defer jobIds never
@@ -1963,6 +1982,10 @@ export function createAccountWorker(
     workerHealth.lastJobCompletedAt = new Date();
     onJobComplete();
     console.log(`✅ [queue=${queueName}] job=${job.id} completed`);
+    // Release the per-(sequence, account) in-flight dispatch budget slot.
+    // The orchestrator INCRs this counter before each dispatch decision;
+    // we DECR here so its cap accurately reflects current queue depth.
+    void releaseInflightSlot(job.data);
   });
 
   worker.on('failed', (job, err) => {
@@ -1970,6 +1993,14 @@ export function createAccountWorker(
       `❌ [queue=${queueName}] job=${job?.id} failed (attempt ${job?.attemptsMade}/${job?.opts?.attempts}):`,
       err.message,
     );
+    // Release on final failure only — BullMQ will keep the job in flight
+    // (delayed state) between retries, so releasing on every attempt would
+    // briefly under-count the orchestrator's view of queue depth. The
+    // counter has a 24h TTL safety net regardless, so worst-case desync
+    // is bounded.
+    if (job && job.attemptsMade >= (job.opts.attempts ?? 1)) {
+      void releaseInflightSlot(job.data);
+    }
   });
 
   worker.on('error', (err) => {

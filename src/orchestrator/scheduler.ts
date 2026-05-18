@@ -27,6 +27,7 @@ import { dispatchPendingQueue } from '../queues/definitions';
 import { getOrchestratorMode } from './mode-reader';
 import { countSlotsForDate, hasSlot, claimSlot, todayInSequenceTz } from './slot-manager';
 import { recordShadowDecision } from './shadow-logger';
+import { tryReserveDispatchSlot } from './dispatch-budget';
 import type {
   OrchCohortLabel,
   OrchDecision,
@@ -402,6 +403,47 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
         );
         decisionsRecorded++;
         continue;
+      }
+
+      // Per-(sequence, account) in-flight cap.
+      //
+      // The per-wake budget alone isn't sufficient when one campaign has
+      // a huge head start: its completed sends fire Realtime events at
+      // ~worker-drain-rate, each producing a wake that re-fills its 10-job
+      // chunk, dwarfing a freshly-started campaign's lone wakes. The
+      // queue depth becomes ~95% the head-start campaign's jobs and the
+      // worker drains FIFO accordingly. The newcomer never gets a fair
+      // share.
+      //
+      // Capping in-flight per (sequence, account) bounds queue depth per
+      // sequence regardless of wake rate. All sequences sharing an
+      // account compete for the same fixed pool of slots; the orchestrator
+      // can't dispatch sequence A's 31st job until sequence A's 1st job
+      // completes (which the worker will do at its natural pace, mixing
+      // it with whatever B has queued).
+      if (channel && channelAccount) {
+        const reserved = await tryReserveDispatchSlot(channelAccount, seq.id);
+        if (!reserved) {
+          await emitDecision(
+            {
+              sequenceId: seq.id,
+              clientId: seq.client_id,
+              contactId: subjectId,
+              executionId: exec.id,
+              stepId: exec.current_step_id,
+              cohortPriority: priority,
+              cohortLabel: label,
+              nextExecutionAt: exec.next_execution_at,
+              consumesSlot,
+              skipReason: 'inflight_budget_full',
+            },
+            event,
+            mode,
+            exec,
+          );
+          decisionsRecorded++;
+          continue;
+        }
       }
     }
 

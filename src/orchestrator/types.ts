@@ -79,7 +79,9 @@ export type OrchSkipReason =
   /** Sequence is the legacy `use_bullmq=false` path */
   | 'not_bullmq_sequence'
   /** Assigned account is at its per-day cap; will be retried on next wake */
-  | 'account_cap_reached';
+  | 'account_cap_reached'
+  /** Per-(sequence, account) in-flight queue cap reached; defers fairness */
+  | 'inflight_budget_full';
 
 /** Row shape for `unipile_sequence_daily_leads` slot reservation table. */
 export interface SlotRow {
