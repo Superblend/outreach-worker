@@ -21,6 +21,7 @@ import { startPollFallback } from './poll-fallback';
 import { handleWakeEvent } from './scheduler';
 import { modeCacheStats } from './mode-reader';
 import { clearAllInflightCounters, listInflightCounters, resetInflightCounter } from './dispatch-budget';
+import { startDispatchBudgetReconciler, runReconcile } from './dispatch-budget-reconciler';
 
 const app = express();
 app.use(express.json());
@@ -47,6 +48,21 @@ app.get('/admin/dispatch-budget', async (_req, res) => {
  *
  * Counters re-INCR naturally on the next wake; this is safe.
  */
+/**
+ * Admin: force a one-shot reconcile cycle. Returns the counts of examined
+ * and corrected counters. The reconciler also runs on a 60s timer in the
+ * background — this endpoint is for manual intervention when waiting a
+ * minute is too long.
+ */
+app.post('/admin/dispatch-budget/reconcile', async (_req, res) => {
+  try {
+    const result = await runReconcile();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+});
+
 app.post('/admin/dispatch-budget/reset', async (req, res) => {
   try {
     if (req.query.all === '1') {
@@ -103,6 +119,12 @@ async function main() {
   // fallback is recovery. Both call handleWakeEvent.
   startRealtimeSubscriber(handleWakeEvent);
   startPollFallback(handleWakeEvent);
+
+  // Periodic safety net that snaps Redis dispatch-budget counters down
+  // to the actual BullMQ queue depth. Eliminates the "stuck counter
+  // freezes a sequence at the cap" failure mode that the 24h TTL alone
+  // is too slow to recover from.
+  startDispatchBudgetReconciler();
 
   const port = config.port;
   app.listen(port, () => {
