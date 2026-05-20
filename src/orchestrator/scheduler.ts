@@ -388,26 +388,38 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
           : channel === 'linkedin_invitation' || channel === 'linkedin_message'
             ? exec.assigned_linkedin_account_id
             : null;
-      if (channel && channelAccount && (await accountAtCap(channelAccount, channel))) {
-        await emitDecision(
-          {
-            sequenceId: seq.id,
-            clientId: seq.client_id,
-            contactId: subjectId,
-            executionId: exec.id,
-            stepId: exec.current_step_id,
-            cohortPriority: priority,
-            cohortLabel: label,
-            nextExecutionAt: exec.next_execution_at,
-            consumesSlot,
-            skipReason: 'account_cap_reached',
-          },
-          event,
-          mode,
-          exec,
-        );
-        decisionsRecorded++;
-        continue;
+      if (channel && channelAccount) {
+        // Same throttle as the in-flight cap below — once we see an
+        // account is at its daily cap, the rest of this wake's candidates
+        // for that account will all hit the same cap. Skip them silently
+        // instead of looping through hundreds of log lines + Redis hits.
+        const capCacheKey = `${channel}:${channelAccount}`;
+        if (accountsAtCapThisWake.has(capCacheKey)) {
+          decisionsRecorded++;
+          continue;
+        }
+        if (await accountAtCap(channelAccount, channel)) {
+          accountsAtCapThisWake.add(capCacheKey);
+          await emitDecision(
+            {
+              sequenceId: seq.id,
+              clientId: seq.client_id,
+              contactId: subjectId,
+              executionId: exec.id,
+              stepId: exec.current_step_id,
+              cohortPriority: priority,
+              cohortLabel: label,
+              nextExecutionAt: exec.next_execution_at,
+              consumesSlot,
+              skipReason: 'account_cap_reached',
+            },
+            event,
+            mode,
+            exec,
+          );
+          decisionsRecorded++;
+          continue;
+        }
       }
 
       // Per-(sequence, account) in-flight cap.
