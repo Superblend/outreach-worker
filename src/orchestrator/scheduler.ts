@@ -928,6 +928,14 @@ async function fetchDueExecutions(sequenceId: string): Promise<ExecutionCandidat
     .eq('status', 'running')
     .eq('execution_state', 'not_started')
     .lte('next_execution_at', nearFutureCutoff)
+    // first_touch_done=true (= follow-ups: delays, second sends, etc.)
+    // sort BEFORE first_touch_done=false (= fresh first-touches). When a
+    // sequence has thousands of first-touches pending and a handful of
+    // follow-ups due, the previous time-only ORDER BY drowned the
+    // follow-ups out of the fetch window (MAX_CANDIDATES_PER_WAKE=500),
+    // so they never reached the in-memory priority sort. Daily first-
+    // touch quotas are unaffected — slot reservations still gate them.
+    .order('first_touch_done', { ascending: false })
     .order('batch_number', { ascending: true, nullsFirst: true })
     .order('next_execution_at', { ascending: true })
     .limit(MAX_CANDIDATES_PER_WAKE);
