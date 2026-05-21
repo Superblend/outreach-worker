@@ -33,17 +33,22 @@ import { connection } from '../queues/definitions';
  * queue. A small cap means each sequence's burst occupies a short
  * window in the queue before the next sequence's chunk takes over.
  *
- * Tuning at cap=10 with 17/min worker pacing:
- *   - 10 jobs per sequence ≈ 35 sec of queue runway
- *   - 3 sequences sharing an account → ~30-job rotating queue → full
- *     round-robin cycle every ~1.7 min
- *   - Much higher and one sequence with a head-start can dominate the
- *     FIFO front for many minutes (see staging stress-test of 3
- *     staggered campaigns where cap=30 starved campaign C for >9 min)
- *   - Much lower (e.g. 3) risks underutilising the worker if wake
- *     events lag the queue drain, leaving brief idle windows
+ * Tuning at cap=5 with realistic worker pacing (17/min email, 2-8/min LinkedIn):
+ *   - 5 jobs per sequence ≈ 18 sec runway at email rate, ~37 sec at LinkedIn
+ *   - 3 sequences sharing an account → ~15-job rotating queue, full cycle ~52 sec
+ *   - Small enough that a newly-joined sequence reaches the queue front
+ *     in well under a minute (vs >10 min observed at cap=10 with a
+ *     pre-existing campaign actively refilling)
+ *   - Large enough that brief wake delays don't starve the worker;
+ *     the 90s poll fallback ensures wakes always fire on time
+ *
+ * Previous values: cap=30 was used initially (starved campaigns for
+ * 9+ min); cap=10 fixed that but still produced ~10 min stalls when a
+ * new sequence joined an account whose existing campaign had a backlog
+ * of older (higher-priority) dispatches in BullMQ. cap=5 shortens the
+ * worst-case stall to ~2 min.
  */
-const MAX_INFLIGHT_PER_SEQ_PER_ACCT = 10;
+const MAX_INFLIGHT_PER_SEQ_PER_ACCT = 5;
 
 const TTL_SECONDS = 86_400; // 24h safety expiry: abandoned counters reset daily
 
