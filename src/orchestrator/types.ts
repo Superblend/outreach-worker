@@ -53,6 +53,15 @@ export interface OrchDecision {
 
   /** Why this was deferred or skipped, if applicable. */
   skipReason?: OrchSkipReason;
+
+  /**
+   * If > 0, dispatch the BullMQ job with `delay: delayMs` so it fires at
+   * exactly `nextExecutionAt`. Used for "near-future" candidates whose
+   * scheduled time falls within NEAR_FUTURE_WINDOW_MS — lets BullMQ
+   * schedule them precisely instead of waiting for the next wake.
+   * 0 or omitted = dispatch immediately (the just-due path).
+   */
+  delayMs?: number;
 }
 
 export type OrchCohortLabel =

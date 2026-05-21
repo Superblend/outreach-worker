@@ -167,6 +167,22 @@ const MAX_CANDIDATES_PER_WAKE = 500;
  */
 const MAX_DISPATCHES_PER_WAKE = 10;
 
+/**
+ * Look-ahead window for delayed dispatches. Items whose `next_execution_at`
+ * lands within this window are pushed to BullMQ with `delay: <remaining ms>`
+ * so the worker fires at the exact scheduled time instead of waiting for
+ * the next orchestrator wake (which could be up to ~90s away with the
+ * current poll-fallback). Items further in the future are skipped this
+ * wake and picked up on a later one — typical case is a follow-up scheduled
+ * 1 day out, which doesn't need precise sub-minute scheduling anyway.
+ *
+ * 5 minutes is a good balance: covers most short-delay follow-ups
+ * (1–5 min) precisely, while keeping queue depth bounded (delayed jobs
+ * count against the in-flight cap, so a sequence's BullMQ footprint can't
+ * balloon by pre-scheduling everything for the day).
+ */
+const NEAR_FUTURE_WINDOW_MS = 5 * 60_000;
+
 // Note: orchestrator does NOT use scanner.ts's 30-second updated_at buffer.
 // That buffer protects scanner from cadence-based double-enqueue (15s loop).
 // The orchestrator runs reactively via Realtime / poll fallback, so the same
@@ -478,6 +494,13 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
       }
     }
 
+    // Items within the near-future window get dispatched as delayed BullMQ
+    // jobs — BullMQ fires the worker at exactly `next_execution_at` instead
+    // of waiting for the next orchestrator wake. Just-due items go out
+    // immediately (delayMs=0).
+    const dueDelta = new Date(exec.next_execution_at).getTime() - Date.now();
+    const delayMs = dueDelta > 0 ? dueDelta : 0;
+
     await emitDecision(
       {
         sequenceId: seq.id,
@@ -489,6 +512,7 @@ async function _handleWakeEventInner(event: OrchSequenceWakeEvent): Promise<void
         cohortLabel: label,
         nextExecutionAt: exec.next_execution_at,
         consumesSlot,
+        delayMs,
       },
       event,
       mode,
@@ -875,21 +899,22 @@ async function loadSequence(sequenceId: string): Promise<SequenceMeta | null> {
 }
 
 /**
- * Fetch executions due now for this sequence.
+ * Fetch executions due now OR near-future for this sequence.
  *
  * Single query (per-sequence volume is bounded by daily_batch_size, typically
  * dozens). Sorting by cohort priority happens in-memory after the fetch.
  *
  * Filters:
  *   - status='running' AND execution_state='not_started' (matches scanner.ts)
- *   - next_execution_at <= now (due now or overdue)
+ *   - next_execution_at <= now + NEAR_FUTURE_WINDOW_MS
+ *     (just-due items go out immediately; items within ~5 min get dispatched
+ *     with BullMQ `delay` so they fire at exactly their scheduled time)
  *
- * No updated_at race guard (see note at the top of this file). When
- * orchestrator-mode enqueue lands, BullMQ jobId dedupe protects against
- * any cross-process race with scanner.ts.
+ * No updated_at race guard (see note at the top of this file). The
+ * cohort loop computes per-candidate delay vs now and routes accordingly.
  */
 async function fetchDueExecutions(sequenceId: string): Promise<ExecutionCandidate[]> {
-  const nowIso = new Date().toISOString();
+  const nearFutureCutoff = new Date(Date.now() + NEAR_FUTURE_WINDOW_MS).toISOString();
 
   const { data, error } = await supabase
     .from('unipile_sequence_executions')
@@ -902,7 +927,7 @@ async function fetchDueExecutions(sequenceId: string): Promise<ExecutionCandidat
     .eq('unipile_sequence_id', sequenceId)
     .eq('status', 'running')
     .eq('execution_state', 'not_started')
-    .lte('next_execution_at', nowIso)
+    .lte('next_execution_at', nearFutureCutoff)
     .order('batch_number', { ascending: true, nullsFirst: true })
     .order('next_execution_at', { ascending: true })
     .limit(MAX_CANDIDATES_PER_WAKE);
@@ -1047,6 +1072,11 @@ async function enqueueExecution(
   const dispatchNonce = randomBytes(3).toString('hex');
   const jobId = `exec-${decision.executionId}-${decision.stepId}-${ORCH_SESSION_ID}-${dispatchNonce}`;
 
+  // For near-future candidates, push to BullMQ with `delay` so the worker
+  // fires at exactly `nextExecutionAt` instead of waiting for the next
+  // orchestrator wake. delayMs=0 (or unset) = dispatch immediately.
+  const delayMs = decision.delayMs && decision.delayMs > 0 ? decision.delayMs : 0;
+
   try {
     await dispatchPendingQueue.add(
       'route-dispatch',
@@ -1063,6 +1093,7 @@ async function enqueueExecution(
         backoff: { type: 'exponential', delay: 2000 },
         jobId,
         priority: decision.cohortPriority,
+        delay: delayMs,
         removeOnComplete: { age: 3600, count: 1000 },
         removeOnFail: { age: 86400, count: 5000 },
       },
@@ -1070,7 +1101,8 @@ async function enqueueExecution(
     console.log(
       `[orchestrator] dispatched exec=${decision.executionId} ` +
         `step=${decision.stepId} priority=${decision.cohortPriority} ` +
-        `cohort=${decision.cohortLabel}`,
+        `cohort=${decision.cohortLabel}` +
+        (delayMs > 0 ? ` delay=${Math.round(delayMs / 1000)}s` : ''),
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
