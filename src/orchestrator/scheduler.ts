@@ -985,10 +985,21 @@ function cohortPriority(
   now: number = Date.now(),
 ): number {
   const overdueMs = now - new Date(nextExecutionAt).getTime();
-  if (overdueMs > 86_400_000) return 1; // very overdue (>24h)
-  if (overdueMs > 3_600_000) return 2;  // overdue (>1h)
-  if (overdueMs > 900_000) return 3;    // mildly overdue (>15min)
-  return 4;                             // on-time / just-due
+  // Thresholds intentionally loose. The previous version of this function
+  // returned P3 for anything >15min overdue — fine for an isolated lead,
+  // but catastrophic for cross-sequence fairness: when campaign A has 1000
+  // leads aging in its queue, they all become P3 and BullMQ's priority-
+  // sort pushes campaign B's P4 just-due leads behind ALL of A's. Starvation
+  // is observable within ~25 min of a campaign starting.
+  //
+  // New thresholds: P4 covers normal operation (BullMQ honors FIFO within
+  // tier, so cross-sequence fairness emerges naturally from add-order).
+  // Priority bumps reserved for genuinely-stuck items where catch-up is
+  // worth disrupting fair-share.
+  if (overdueMs > 7 * 86_400_000) return 1;     // >7 days (clearly stuck)
+  if (overdueMs > 86_400_000) return 2;          // >24 hours (badly delayed)
+  if (overdueMs > 4 * 3_600_000) return 3;       // >4 hours (significantly late)
+  return 4;                                       // normal operation
 }
 
 /**
