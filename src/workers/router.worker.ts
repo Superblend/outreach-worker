@@ -121,13 +121,20 @@ export function startRouterWorker(): Worker {
       const stepData = Array.isArray(rawStep) ? rawStep[0] : rawStep;
       const stepType = stepData?.step_type ?? 'unknown';
 
-      // 3. Decide destination queue.
+      // 3. Decide destination queue. Phase 4: per-(account, sequence)
+      //    queues. One queue per (account, sequence) pair lets multiple
+      //    sequences sharing an account each have their own dispatch
+      //    pipeline, with cross-sequence fairness emerging from the
+      //    shared Redis pacing key (one worker per queue, all workers
+      //    for the same account take turns via the atomic acquire*Slot
+      //    Lua scripts).
+      const sequenceId = exec.unipile_sequence_id;
       let targetQueueName: string;
       let channel: string;
       if (LINKEDIN_STEP_TYPES.has(stepType)) {
         const accountId = exec.assigned_linkedin_account_id;
         if (accountId) {
-          targetQueueName = `outreach-linkedin-${accountId}`;
+          targetQueueName = `outreach-linkedin-${accountId}-seq-${sequenceId}`;
           channel = 'linkedin';
         } else {
           // No LinkedIn account assigned yet — fall through to shared queue.
@@ -153,7 +160,10 @@ export function startRouterWorker(): Worker {
         // or fail gracefully if no account is available.
         const emailAccountId = exec.assigned_email_account_id;
         if (emailAccountId) {
-          targetQueueName = `outreach-email-acct-${emailAccountId}`;
+          // Phase 4: per-(account, sequence) queue — see LinkedIn routing
+          // above for the rationale. Cross-sequence fairness via shared
+          // Redis pacing key on `pacing:email:acct:{accountId}`.
+          targetQueueName = `outreach-email-acct-${emailAccountId}-seq-${sequenceId}`;
         } else {
           targetQueueName = 'outreach-executions';
         }

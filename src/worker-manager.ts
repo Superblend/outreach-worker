@@ -135,9 +135,13 @@ class WorkerManager {
       }
 
       for (const key of keys) {
-        // Key format: bull:outreach-linkedin-{accountId}:id,
-        //             bull:outreach-email-acct-{accountId}:id,
-        //          or bull:outreach-email-client-{clientId}:id (legacy)
+        // Key format (any of):
+        //   bull:outreach-linkedin-{accountId}:id                       (legacy, in-flight drain only)
+        //   bull:outreach-linkedin-{accountId}-seq-{sequenceId}:id      (Phase 4 — current)
+        //   bull:outreach-email-acct-{accountId}:id                     (legacy)
+        //   bull:outreach-email-acct-{accountId}-seq-{sequenceId}:id    (Phase 4 — current)
+        //   bull:outreach-email-client-{clientId}:id                    (legacy, Phase 1)
+        // The regex's `.+` accepts the `-seq-...` suffix transparently.
         const match = key.match(/^bull:(outreach-(?:linkedin|email-acct|email-client)-.+):id$/);
         if (!match) {
           console.warn(`WorkerManager: unexpected key format skipped: ${key}`);
@@ -265,12 +269,36 @@ class WorkerManager {
 function parseAccountQueue(
   queueName: string,
 ): { channel: 'linkedin' | 'email'; entityId: string } | null {
+  // Phase 4: per-(account, sequence) queues. Naming convention:
+  //   outreach-linkedin-{accountId}-seq-{sequenceId}
+  //   outreach-email-acct-{accountId}-seq-{sequenceId}
+  // One Worker instance per queue, each with concurrency=1. Multiple
+  // workers for the same account fairly share send slots via the
+  // Redis-coordinated pacing key (`linkedin:{accountId}` /
+  // `pacing:email:acct:{accountId}`) — when one worker grabs a slot,
+  // the next worker that calls acquire*Slot is automatically scheduled
+  // ~8 sec / ~2 sec later. Cross-sequence round-robin emerges naturally
+  // from the per-(acct, seq) topology + shared pacing.
+  //
+  // entityId is the ACCOUNT id (not the account-seq combo) so pacing
+  // and any other account-scoped logic continues to work unchanged.
   if (queueName.startsWith('outreach-linkedin-')) {
-    return { channel: 'linkedin', entityId: queueName.slice('outreach-linkedin-'.length) };
+    const tail = queueName.slice('outreach-linkedin-'.length);
+    const seqIdx = tail.indexOf('-seq-');
+    if (seqIdx > 0) {
+      return { channel: 'linkedin', entityId: tail.slice(0, seqIdx) };
+    }
+    return { channel: 'linkedin', entityId: tail };
   }
-  // Phase 2: per-account email queues (preferred).
+  // Phase 2 → Phase 4: per-account email (still supported for in-flight
+  // drain) or per-(account, sequence) email queues.
   if (queueName.startsWith('outreach-email-acct-')) {
-    return { channel: 'email', entityId: queueName.slice('outreach-email-acct-'.length) };
+    const tail = queueName.slice('outreach-email-acct-'.length);
+    const seqIdx = tail.indexOf('-seq-');
+    if (seqIdx > 0) {
+      return { channel: 'email', entityId: tail.slice(0, seqIdx) };
+    }
+    return { channel: 'email', entityId: tail };
   }
   // Legacy per-client email queue — kept so any in-flight pre-Phase-2 jobs
   // still get a consumer until they drain.

@@ -113,8 +113,13 @@ else
 end
 `;
 
-async function acquireEmailSlot(clientId: string): Promise<number> {
-  const key = `pacing:email:client:${clientId}`;
+async function acquireEmailSlot(accountId: string): Promise<number> {
+  // Phase 4: pacing keyed by account (the unit that deliverability cares
+  // about), not by client. Previously this was keyed by client_id, which
+  // throttled all of a client's mailboxes together — a client with 5
+  // accounts had the same effective rate as one with 1. Per-account
+  // keying lets each mailbox have its own rate.
+  const key = `pacing:email:acct:${accountId}`;
   const now = Date.now();
   const gap = Math.round(EMAIL_PACING_MIN_MS + Math.random() * (EMAIL_PACING_MAX_MS - EMAIL_PACING_MIN_MS));
   const waitMs = await connection.eval(EMAIL_PACING_LUA, 1, key, String(now), String(gap), String(EMAIL_PACING_TTL_S)) as number;
@@ -1909,7 +1914,12 @@ export function createAccountWorker(
         console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${entityId} slot acquired`);
       }
 
-      // Per-client email pacing — only for actual outbound email sends.
+      // Per-account email pacing — only for actual outbound email sends.
+      // `entityId` is the account_id (the WorkerManager extracts it from
+      // the queue name, regardless of whether the queue is per-account
+      // or per-(account, sequence)). Multiple workers for the same
+      // account share the same Redis pacing key, so they take turns
+      // automatically via the atomic Lua acquire script.
       if (channel === 'email' && stepType === 'email') {
         const waitMs = await acquireEmailSlot(entityId);
         if (waitMs > 0) {
