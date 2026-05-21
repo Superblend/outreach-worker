@@ -15,7 +15,12 @@ import type { OrchSequenceWakeEvent } from './types';
 
 type WakeHandler = (event: OrchSequenceWakeEvent) => Promise<void> | void;
 
-const POLL_INTERVAL_MS = 5 * 60_000;
+// 90s — tight enough that a follow-up whose `next_execution_at` lands
+// between Realtime events is picked up within ~1.5 min of becoming due
+// (vs ~5 min with the previous 5-minute interval). Wake handler short-
+// circuits cheaply (<5 ms) on sequences with nothing due, so even at a
+// few thousand active sequences the cycle is well under a second.
+const POLL_INTERVAL_MS = 90_000;
 
 let pollTimer: NodeJS.Timeout | null = null;
 

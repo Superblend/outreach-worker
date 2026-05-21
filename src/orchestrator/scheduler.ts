@@ -915,37 +915,59 @@ async function fetchDueExecutions(sequenceId: string): Promise<ExecutionCandidat
 }
 
 /**
- * Ported verbatim from scanner.ts. Lower number = higher BullMQ priority.
- * Keeping the exact integer mapping is what lets shadow-mode comparison
- * pair our decisions with the legacy scanner's enqueues.
+ * Priority = how late this candidate is. Lower number = higher BullMQ priority.
+ *
+ * The first-touch / follow-up distinction is intentionally GONE. The previous
+ * version of this function gave fresh first-touches (P4) higher priority than
+ * on-time follow-ups (P6), which meant a follow-up scheduled for `+1min`
+ * waited behind whatever fresh first-touches were lined up in the same cohort
+ * — only beating them after going >15min overdue (P3). User-visible symptom:
+ * follow-up timings drifted long, sometimes by tens of minutes, despite the
+ * step's configured delay being short.
+ *
+ * The fix: sort everything by *due time*. Just-due follow-ups and just-due
+ * first-touches all get P4 and break ties on `next_execution_at` ascending
+ * (preserved by Postgres ORDER BY in fetchDueExecutions plus stable JS sort).
+ * So a follow-up scheduled at 09:01 fires before a first-touch scheduled at
+ * 09:02, and a first-touch scheduled at 09:00 fires before a follow-up
+ * scheduled at 09:01 — exactly what you'd intuitively expect.
+ *
+ * The overdue tiers (P1 >24h, P2 >1h, P3 >15min) still exist so stuck or
+ * deferred items jump ahead of fresh on-time work. Applies to both
+ * first-touches AND follow-ups — if either type sits late for any reason,
+ * it gets priority.
+ *
+ * Daily first-touch quotas are NOT affected: `daily_batch_size` is enforced
+ * by the slot reservation system, not by this priority. First-touches still
+ * cap at N/day; this function only orders the dispatch sequence within that
+ * cap relative to follow-ups.
+ *
+ * The `cohort` and `firstTouchDone` parameters are kept for signature
+ * compatibility with the scanner.ts caller; they're intentionally unused now.
  */
 function cohortPriority(
-  cohort: string | null,
-  firstTouchDone: boolean,
+  _cohort: string | null,
+  _firstTouchDone: boolean,
   nextExecutionAt: string,
   now: number = Date.now(),
 ): number {
-  if (cohort === 'in_flight') {
-    const overdueMs = now - new Date(nextExecutionAt).getTime();
-    if (overdueMs > 86_400_000) return 1;
-    if (overdueMs > 3_600_000) return 2;
-    if (overdueMs > 900_000) return 3;
-    return 6;
-  }
-  if (cohort === 'new_today') return firstTouchDone ? 5 : 4;
-  return 7;
+  const overdueMs = now - new Date(nextExecutionAt).getTime();
+  if (overdueMs > 86_400_000) return 1; // very overdue (>24h)
+  if (overdueMs > 3_600_000) return 2;  // overdue (>1h)
+  if (overdueMs > 900_000) return 3;    // mildly overdue (>15min)
+  return 4;                             // on-time / just-due
 }
 
 /**
  * Map the numeric priority into a human label for the shadow log.
- * The numeric value is the authoritative input to BullMQ; the label is
- * for analysis queries.
+ * Since the priority no longer encodes "first-touch vs follow-up," the
+ * labels are now purely about *how late* the item was when dispatched.
  */
 function cohortLabelFromPriority(priority: number): OrchCohortLabel {
-  if (priority <= 3) return 'p3_multi_day_follow_up'; // overdue in_flight buckets
-  if (priority === 4) return 'p1_new_contact';
-  if (priority === 5) return 'p2_same_day_chain';
-  if (priority === 6) return 'p2_same_day_chain'; // on-time in_flight, still same-day class
+  if (priority === 1) return 'p3_multi_day_follow_up'; // very overdue (>24h)
+  if (priority === 2) return 'p3_multi_day_follow_up'; // overdue (>1h)
+  if (priority === 3) return 'p2_same_day_chain';      // mildly overdue (>15min)
+  if (priority === 4) return 'p1_new_contact';         // on-time / just-due
   return 'p4_low_priority';
 }
 
