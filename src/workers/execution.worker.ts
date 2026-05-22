@@ -64,13 +64,63 @@ const LINKEDIN_STEP_TYPES = [
 
 const SENDING_STEP_TYPES = ['linkedin_invitation', 'linkedin_message', 'email'];
 
-const LINKEDIN_PACING_MIN_MS = 45_000;
-const LINKEDIN_PACING_MAX_MS = 90_000;
+// LinkedIn pacing classes. Different LinkedIn actions carry very different
+// account-safety risk, so we pace them separately. Each class has its own
+// Redis key, so e.g. a profile_visit firing does NOT slow down an
+// invitation about to fire on the same account — they're on independent
+// "tracks." Daily caps still enforced by check_and_increment_daily_limit
+// RPC, so account-day-level limits can't be exceeded regardless.
+//
+//   write  — invitations, messages, voice notes. Highest ban risk; keep
+//            the conservative 45-90s. This is where LinkedIn enforcement
+//            kicks in hardest.
+//   engage — post likes/comments, endorsements. Moderate risk, less
+//            sensitive to cadence than writes. 15-30s.
+//   read   — profile visits. Very tolerated by LinkedIn (the "who viewed
+//            your profile" feature literally surfaces these). Bot-like
+//            volume can still trip detection but cadence within tens of
+//            seconds is well within normal user behavior. 8-18s.
+//
+// All env-var overridable so we can tighten any class without redeploying
+// if an account-level flag surfaces.
+const LINKEDIN_PACING_WRITE_MIN_MS = Number(process.env.LINKEDIN_PACING_WRITE_MIN_MS ?? 45_000);
+const LINKEDIN_PACING_WRITE_MAX_MS = Number(process.env.LINKEDIN_PACING_WRITE_MAX_MS ?? 90_000);
+const LINKEDIN_PACING_ENGAGE_MIN_MS = Number(process.env.LINKEDIN_PACING_ENGAGE_MIN_MS ?? 15_000);
+const LINKEDIN_PACING_ENGAGE_MAX_MS = Number(process.env.LINKEDIN_PACING_ENGAGE_MAX_MS ?? 30_000);
+const LINKEDIN_PACING_READ_MIN_MS = Number(process.env.LINKEDIN_PACING_READ_MIN_MS ?? 8_000);
+const LINKEDIN_PACING_READ_MAX_MS = Number(process.env.LINKEDIN_PACING_READ_MAX_MS ?? 18_000);
 const LINKEDIN_PACING_TTL_S = 300; // safety TTL: 5 min
 
-// Atomically checks and acquires the per-account LinkedIn pacing slot.
-// Returns 0 if the slot is acquired (caller may proceed), or the number of ms
-// to wait if the slot is still locked by a recent send.
+type LinkedInPacingClass = 'write' | 'engage' | 'read';
+
+function linkedInPacingClass(stepType: string): LinkedInPacingClass {
+  switch (stepType) {
+    case 'linkedin_invitation':
+    case 'linkedin_message':
+    case 'linkedin_voice_note':
+      return 'write';
+    case 'linkedin_engage_post':
+    case 'linkedin_endorse':
+      return 'engage';
+    case 'linkedin_profile_visit':
+      return 'read';
+    default:
+      // Unknown LinkedIn step type — be safe, treat as write.
+      return 'write';
+  }
+}
+
+function pacingBoundsForClass(cls: LinkedInPacingClass): { minMs: number; maxMs: number } {
+  switch (cls) {
+    case 'write':  return { minMs: LINKEDIN_PACING_WRITE_MIN_MS,  maxMs: LINKEDIN_PACING_WRITE_MAX_MS };
+    case 'engage': return { minMs: LINKEDIN_PACING_ENGAGE_MIN_MS, maxMs: LINKEDIN_PACING_ENGAGE_MAX_MS };
+    case 'read':   return { minMs: LINKEDIN_PACING_READ_MIN_MS,   maxMs: LINKEDIN_PACING_READ_MAX_MS };
+  }
+}
+
+// Atomically checks and acquires the per-account, per-class LinkedIn pacing
+// slot. Returns 0 if the slot is acquired (caller may proceed), or the
+// number of ms to wait if the slot is still locked by a recent send.
 // Uses a Lua script so the read-compare-set is atomic against Redis.
 const PACING_LUA = `
 local key = KEYS[1]
@@ -87,10 +137,16 @@ redis.call('SET', key, tostring(now), 'EX', math.ceil(minGap / 1000))
 return 0
 `;
 
-async function acquireLinkedInSlot(accountId: string): Promise<number> {
-  const key = `linkedin:${accountId}`;
+async function acquireLinkedInSlot(accountId: string, stepType: string): Promise<number> {
+  const cls = linkedInPacingClass(stepType);
+  const { minMs, maxMs } = pacingBoundsForClass(cls);
+  // Class-keyed so classes don't compete with each other on the same
+  // account. `linkedin:{account}` (legacy) is no longer used — see PR
+  // notes; the new scheme is `linkedin:{class}:{account}`. Stale legacy
+  // keys naturally expire via the 5-min TTL.
+  const key = `linkedin:${cls}:${accountId}`;
   const now = Date.now();
-  const gap = Math.round(LINKEDIN_PACING_MIN_MS + Math.random() * (LINKEDIN_PACING_MAX_MS - LINKEDIN_PACING_MIN_MS));
+  const gap = Math.round(minMs + Math.random() * (maxMs - minMs));
   const waitMs = await connection.eval(PACING_LUA, 1, key, String(now), String(gap), String(LINKEDIN_PACING_TTL_S)) as number;
   return waitMs;
 }
@@ -1885,10 +1941,16 @@ export function createAccountWorker(
         }
       }
 
-      // Per-account LinkedIn pacing — only for steps that actually call LinkedIn APIs.
-      // Internal steps (delay, conditional) must pass through without consuming a slot.
+      // Per-account, per-class LinkedIn pacing — only for steps that
+      // actually call LinkedIn APIs. Internal steps (delay, conditional)
+      // must pass through without consuming a slot. Three classes:
+      // read (profile_visit), engage (engage_post, endorse),
+      // write (invitation, message, voice_note). Each has its own
+      // per-account counter so a fast profile_visit cadence doesn't slow
+      // down the conservative invitation pacing on the same account.
       if (channel === 'linkedin' && PACEABLE_LINKEDIN_STEP_TYPES.has(stepType ?? '')) {
-        const waitMs = await acquireLinkedInSlot(entityId);
+        const cls = linkedInPacingClass(stepType ?? '');
+        const waitMs = await acquireLinkedInSlot(entityId, stepType ?? '');
         if (waitMs > 0) {
           // Stable jobId: deduplicates repeated requeues for the same execution-step
           // within a worker session, preventing delayed-job pile-up.
@@ -1906,12 +1968,12 @@ export function createAccountWorker(
             removeOnFail: { age: 86400, count: 5000 },
           });
           console.log(
-            `⏳ [linkedin-pacing] exec=${execution_id} account=${entityId} requeued in ${Math.round(requeueDelay / 1000)}s`,
+            `⏳ [linkedin-pacing class=${cls}] exec=${execution_id} account=${entityId} requeued in ${Math.round(requeueDelay / 1000)}s`,
           );
           await worker.rateLimit(requeueDelay);
           throw Worker.RateLimitError();
         }
-        console.log(`✅ [linkedin-pacing] exec=${execution_id} account=${entityId} slot acquired`);
+        console.log(`✅ [linkedin-pacing class=${cls}] exec=${execution_id} account=${entityId} slot acquired`);
       }
 
       // Per-account email pacing — only for actual outbound email sends.
