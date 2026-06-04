@@ -31,7 +31,7 @@ import {
 const mockUnipileFetch = vi.fn();
 const mockSupabaseFrom = vi.fn();
 
-vi.mock('../../supabase', () => ({
+vi.mock('../supabase', () => ({
   supabase: {
     from: (...args: any[]) => mockSupabaseFrom(...args),
     rpc: vi.fn().mockResolvedValue({ data: null, error: null }),
@@ -39,22 +39,22 @@ vi.mock('../../supabase', () => ({
   invokeEdgeFunction: vi.fn().mockResolvedValue({ data: null, error: null }),
 }));
 
-vi.mock('../../config', () => ({
+vi.mock('../config', () => ({
   config: {
     unipile: { apiUrl: 'https://api.unipile.test', apiKey: 'test-key' },
     supabase: { url: 'https://test.supabase.co', anonKey: 'test-anon' },
   },
 }));
 
-vi.mock('../unipile-fetch', () => ({
+vi.mock('../lib/unipile-fetch', () => ({
   unipileFetch: (...args: any[]) => mockUnipileFetch(...args),
 }));
 
-vi.mock('../variable-replace', () => ({
+vi.mock('../lib/variable-replace', () => ({
   normalizeAndReplace: (msg: string) => msg,
 }));
 
-import { sendLinkedInMessage } from '../unipile-send-linkedin-message';
+import { sendLinkedInMessage } from '../lib/unipile-send-linkedin-message';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -231,6 +231,49 @@ describe('sendLinkedInMessage — allowInviteFallback', () => {
     expect(result.success).toBe(true);
     expect(result.message_id).toBe('msg-direct');
     expect(result.chat_id).toBe('existing-chat');
+  });
+
+  // Regression: a first-touch linkedin_message reached via a "connected → yes"
+  // conditional (no prior invite step → allowInviteFallback stays true) must NOT
+  // invite an already-connected lead. is_relationship/network_distance from the
+  // profile fetch gate the invite off so the lead is messaged. (FundReport, 2026-06-04)
+  it('does NOT invite an already-connected lead (is_relationship) even when allowInviteFallback=true', async () => {
+    mockUnipileFetch
+      .mockResolvedValueOnce(makeJsonResponse({ provider_id: 'prov-conn', is_relationship: true })) // profile: connected
+      .mockResolvedValueOnce(makeJsonResponse({ items: [] }))                                        // chat lookup empty
+      .mockResolvedValueOnce(makeJsonResponse({ id: 'new-msg', chat_id: 'new-chat' }));              // create chat → real send
+
+    const result = await sendLinkedInMessage({
+      account_id: 'acct-1',
+      lead: { linkedin: 'https://linkedin.com/in/connectedlead' },
+      message: 'Hi connection',
+      // allowInviteFallback defaults to true (first-touch via condition_yes path)
+    });
+
+    const urls = mockUnipileFetch.mock.calls.map((c: any[]) => c[0] as string);
+    expect(urls.some((u: string) => u.includes('/users/invite'))).toBe(false);
+    expect(result.success).toBe(true);
+    expect(result.invitation_id).toBeUndefined();
+    expect(isPhantomMessageResult(result)).toBe(false);
+  });
+
+  it('treats network_distance FIRST_DEGREE as connected (messages via existing chat, no invite)', async () => {
+    mockUnipileFetch
+      .mockResolvedValueOnce(makeJsonResponse({ provider_id: 'prov-fd', network_distance: 'FIRST_DEGREE' }))
+      .mockResolvedValueOnce(makeJsonResponse({ items: [{ id: 'chat-fd', attendee_provider_id: 'prov-fd' }] }))
+      .mockResolvedValueOnce(makeJsonResponse({ id: 'msg-fd' }));
+
+    const result = await sendLinkedInMessage({
+      account_id: 'acct-1',
+      lead: { linkedin: 'https://linkedin.com/in/fdlead' },
+      message: 'Hi',
+    });
+
+    const urls = mockUnipileFetch.mock.calls.map((c: any[]) => c[0] as string);
+    expect(urls.some((u: string) => u.includes('/users/invite'))).toBe(false);
+    expect(result.success).toBe(true);
+    expect(result.message_id).toBe('msg-fd');
+    expect(result.chat_id).toBe('chat-fd');
   });
 });
 

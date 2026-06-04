@@ -79,8 +79,20 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
     return { success: false, error: 'Could not get provider_id from LinkedIn profile' };
   }
 
-  // Step 4: Try invite endpoint (skipped for follow-up steps where allowInviteFallback=false)
-  if (allowInviteFallback) {
+  // Already a 1st-degree connection? Then MESSAGE them — never invite. Mirrors the
+  // connection check in unipile-check-connection.ts. Without this, a message step
+  // reached via a "connected → yes" conditional (no prior invite step, so
+  // allowInviteFallback stays true) would hit the invite endpoint, get back an
+  // invitation_id, and trip the phantom_message_guard — so an already-connected lead
+  // is invited instead of messaged and the step is skipped. (Incident 2026-06-04, FundReport.)
+  const isFirstDegree =
+    profileData?.is_relationship === true ||
+    profileData?.network_distance === 'FIRST_DEGREE';
+
+  // Step 4: Try invite endpoint — only for NON-connections, and only when the step
+  // allows it (follow-up steps set allowInviteFallback=false). A 1st-degree connection
+  // falls through to the chat lookup / create path below and is messaged directly.
+  if (allowInviteFallback && !isFirstDegree) {
     const inviteRes = await unipileFetch(`${apiUrl}/api/v1/users/invite`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-API-KEY': config.unipile.apiKey },
