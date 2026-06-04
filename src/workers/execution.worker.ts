@@ -2103,25 +2103,57 @@ export function startExecutionWorker() {
       const { execution_id, group_key, channel } = job.data;
       console.log(`🚀 [queue=outreach-executions job=${job.id}] execution=${execution_id} group=${group_key} channel=${channel}`);
 
-      // Active-window guard — mirrors the guard in createAccountWorker.
-      {
-        const { data: seqRow } = await supabase
+      // Active-window guard + LinkedIn pacing backstop. One fetch resolves the window
+      // meta, the ACTUAL current step type, and the assigned LinkedIn account.
+      const { data: seqRow } = await supabase
+        .from('unipile_sequence_executions')
+        .select('next_execution_at, current_step_id, assigned_linkedin_account_id, unipile_sequences(timezone, active_days, scheduled_start_time, scheduled_end_time), unipile_sequence_steps!unipile_sequence_executions_current_step_id_fkey(step_type)')
+        .eq('id', execution_id)
+        .single();
+      const seqMeta = (seqRow as any)?.unipile_sequences;
+      const guard = isWithinActiveWindow(seqMeta);
+      if (!guard.ok) {
+        const newTs = nextValidSendUtc(seqMeta);
+        await supabase
           .from('unipile_sequence_executions')
-          .select('next_execution_at, unipile_sequences(timezone, active_days, scheduled_start_time, scheduled_end_time)')
+          .update({ next_execution_at: newTs, updated_at: new Date().toISOString() })
           .eq('id', execution_id)
-          .single();
-        const seqMeta = (seqRow as any)?.unipile_sequences;
-        const guard = isWithinActiveWindow(seqMeta);
-        if (!guard.ok) {
-          const newTs = nextValidSendUtc(seqMeta);
-          await supabase
-            .from('unipile_sequence_executions')
-            .update({ next_execution_at: newTs, updated_at: new Date().toISOString() })
-            .eq('id', execution_id)
-            .eq('next_execution_at', seqRow?.next_execution_at) // CAS: only one racing worker wins
-            .select('id');
-          console.log(`⏸️ Execution ${execution_id} deferred (${guard.reason}) → ${newTs}`);
-          return; // ack the job — no daily limit, no step handler
+          .eq('next_execution_at', (seqRow as any)?.next_execution_at) // CAS: only one racing worker wins
+          .select('id');
+        console.log(`⏸️ Execution ${execution_id} deferred (${guard.reason}) → ${newTs}`);
+        return; // ack the job — no daily limit, no step handler
+      }
+
+      // Per-account LinkedIn pacing BACKSTOP. LinkedIn sends normally run on per-account
+      // queues (which pace them). The router falls back to this shared queue when the
+      // step_type can't be resolved at dispatch time — and this queue runs concurrency=10
+      // with NO pacing of its own, so without this a fresh duplicate-launch flood fires
+      // LinkedIn actions unthrottled (Gozen 2026-06-04: 27 invites in 7 min on a 1-day-old
+      // account). Resolve the ACTUAL current step fresh (not the possibly-stale job
+      // step_type) and pace by its real class. Requeue-with-delay then ACK — we must NOT
+      // call worker.rateLimit() here: this is a SHARED queue, and stalling it would back
+      // up delay/conditional traffic for every client behind one paced send.
+      {
+        const rawStep = (seqRow as any)?.unipile_sequence_steps;
+        const curStepType = (Array.isArray(rawStep) ? rawStep[0]?.step_type : rawStep?.step_type) ?? null;
+        const liAccount = (seqRow as any)?.assigned_linkedin_account_id ?? null;
+        if (curStepType && PACEABLE_LINKEDIN_STEP_TYPES.has(curStepType) && liAccount) {
+          const cls = linkedInPacingClass(curStepType);
+          const waitMs = await acquireLinkedInSlot(liAccount, curStepType);
+          if (waitMs > 0) {
+            const requeueDelay = Math.max(waitMs, 1000) + Math.floor(Math.random() * 500);
+            await executionQueue.add('execute-step', job.data, {
+              delay: requeueDelay,
+              attempts: 3,
+              backoff: { type: 'exponential', delay: 5000 },
+              priority: job.opts.priority,
+              removeOnComplete: { age: 3600, count: 1000 },
+              removeOnFail: { age: 86400, count: 5000 },
+            });
+            console.log(`⏳ [linkedin-pacing class=${cls} queue=outreach-executions] exec=${execution_id} account=${liAccount} step=${curStepType} requeued in ${Math.round(requeueDelay / 1000)}s`);
+            return; // ack — the delayed job retries; shared worker keeps flowing
+          }
+          console.log(`✅ [linkedin-pacing class=${cls} queue=outreach-executions] exec=${execution_id} account=${liAccount} step=${curStepType} slot acquired`);
         }
       }
 
