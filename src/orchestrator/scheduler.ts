@@ -83,6 +83,20 @@ const LINKEDIN_MESSAGE_TYPES = new Set([
   'linkedin_profile_visit',
 ]);
 
+// Per-channel default daily cap — MUST mirror the worker's
+// check_and_increment_daily_limit p_max_default (execution.worker.ts: invitations
+// 30, messages/emails 50). When account_daily_limits.max_* is NULL the worker's RPC
+// caps at these via COALESCE(max, p_max_default), so the orchestrator pre-flight
+// must use the same numbers. Reading NULL as "uncapped" (the old behavior) made the
+// orchestrator dispatch sends the worker then rejected at the default — and each
+// rejection burned the shared write-pacing slot, starving other channels on the
+// account. (Root cause of the Tako/FundReport send-stall, 2026-06-04.)
+const DEFAULT_DAILY_CAP: Record<CapChannel, number> = {
+  email: 50,
+  linkedin_invitation: 30,
+  linkedin_message: 50,
+};
+
 function capChannelForStep(stepType: string | null | undefined): CapChannel | null {
   if (!stepType) return null;
   if (stepType === 'email') return 'email';
@@ -129,7 +143,11 @@ async function accountAtCap(accountId: string, channel: CapChannel): Promise<boo
 
   const row = data as unknown as Record<string, number | null> | null;
   const sent = row ? Number(row[sentCol] ?? 0) : 0;
-  const max = row ? Number(row[maxCol] ?? 0) : 0;
+  // NULL max ⇒ the per-channel DEFAULT cap (mirrors the worker RPC's
+  // COALESCE(max, p_max_default)), NOT "uncapped". Otherwise the worker rejects
+  // at the default and burns a pacing slot per rejected send. See DEFAULT_DAILY_CAP.
+  const rawMax = row ? row[maxCol] : null;
+  const max = rawMax != null ? Number(rawMax) : DEFAULT_DAILY_CAP[channel];
 
   capCache.set(cacheKey, { sent, max, expiresAt: now + CAP_CACHE_TTL_MS });
   return max > 0 && sent >= max;
