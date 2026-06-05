@@ -652,25 +652,34 @@ async function reconcileSoftFailedSlots(
   const execRows = execs as Array<{ id: string; contact_id: string }>;
   const execIds = execRows.map((e) => e.id);
 
-  // 3. Step-result existence check. Only executions with ZERO step_results
-  //    are eligible for slot release — anything else means the worker
-  //    actually called the provider and consumed real send budget.
-  const { data: attempts, error: attemptsErr } = await supabase
+  // 3. Send-success check. An execution is eligible for slot release if it never
+  //    actually SENT — i.e. it has no SUCCESSFUL invitation/message/email result.
+  //    Non-send or failed results (e.g. a 422 profile_visit on a bad/unreachable
+  //    profile) consume NO send budget, so the lead should be replaced to hit the
+  //    daily batch. (Previously this released only ZERO-result execs, so a
+  //    failed-visit lead was wrongly kept and the day came up short — Gozen 27/30
+  //    on 2026-06-05: 3 leads failed their profile_visit and terminated without
+  //    inviting.) These execs are terminal, so they never send later → no
+  //    double-contact risk; and a failed visit consumed no invite budget.
+  const SEND_STEP_TYPES = ['linkedin_invitation', 'linkedin_message', 'linkedin_voice_note', 'email'];
+  const { data: sends, error: sendsErr } = await supabase
     .from('unipile_step_results')
     .select('execution_id')
-    .in('execution_id', execIds);
-  if (attemptsErr) {
+    .in('execution_id', execIds)
+    .eq('status', 'success')
+    .in('step_type', SEND_STEP_TYPES);
+  if (sendsErr) {
     console.error(
-      `[reconcile] step_results read failed sequence=${seq.id}: ${attemptsErr.message}`,
+      `[reconcile] step_results read failed sequence=${seq.id}: ${sendsErr.message}`,
     );
     return 0;
   }
-  const attemptedExecIds = new Set(
-    (attempts ?? []).map((a) => (a as { execution_id: string }).execution_id),
+  const sentExecIds = new Set(
+    (sends ?? []).map((a) => (a as { execution_id: string }).execution_id),
   );
 
   const contactsToRelease = execRows
-    .filter((e) => !attemptedExecIds.has(e.id))
+    .filter((e) => !sentExecIds.has(e.id))
     .map((e) => e.contact_id);
 
   if (contactsToRelease.length === 0) return 0;
