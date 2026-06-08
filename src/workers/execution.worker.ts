@@ -858,9 +858,14 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     }
   }
 
-  // 11. Daily limit check
+  // 11. Daily limit GATE (dry-run). We only credit the counter AFTER a confirmed
+  // send (see step 12b), so a stalled/hung/failed/phantom send can never inflate it.
+  // NOTE: preIncremented* below are now referenced only by the inert legacy rollback
+  // blocks (they stay null), and are safe to delete in a follow-up cleanup.
   let preIncrementedAccountId: string | null = null;
   let preIncrementedMessageType: string | null = null;
+  let creditAccountId: string | null = null;
+  let creditMessageType: string | null = null;
 
   if (SENDING_STEP_TYPES.includes(currentStep.step_type)) {
     const messageType = currentStep.step_type === 'email' ? 'emails'
@@ -873,10 +878,12 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     const defaultLimit = messageType === 'linkedin_invitations' ? 30 : 50;
 
     if (accountId) {
+      // Dry-run: checks subscription + per-account cap WITHOUT incrementing.
       const { data: limitResult, error: limitError } = await supabase.rpc('check_and_increment_daily_limit', {
         p_account_id: accountId,
         p_message_type: messageType,
         p_max_default: currentStep.configuration?.daily_limit || defaultLimit,
+        p_dry_run: true,
       });
       if (limitError) {
         console.error(`❌ [${execution_id}] check_and_increment_daily_limit RPC failed (${messageType}):`, limitError.message);
@@ -897,8 +904,9 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
       }
 
       if (limitResult?.allowed) {
-        preIncrementedAccountId = accountId;
-        preIncrementedMessageType = messageType;
+        // Remember what to credit AFTER the send actually succeeds (step 12b).
+        creditAccountId = accountId;
+        creditMessageType = messageType;
       }
     }
   }
@@ -1614,7 +1622,23 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     await stepResultWriter.flush();
   }
 
-  // 13. Rollback daily limit on failure
+  // 12b. Credit the daily counter ONLY after a confirmed real send (post-increment).
+  // The pre-send check (step 11) is a dry-run gate, so stalls/hangs/phantoms/failures
+  // never touch the counter — only a real success increments it. This is the fix for
+  // counter inflation that was falsely capping accounts.
+  if (stepSuccess && creditAccountId) {
+    const creditDefault = creditMessageType === 'linkedin_invitations' ? 30 : 50;
+    const { error: creditErr } = await supabase.rpc('check_and_increment_daily_limit', {
+      p_account_id: creditAccountId,
+      p_message_type: creditMessageType,
+      p_max_default: currentStep.configuration?.daily_limit || creditDefault,
+    });
+    if (creditErr) {
+      console.warn(`⚠️ [${execution_id}] daily-limit credit failed (${creditMessageType}):`, creditErr.message);
+    }
+  }
+
+  // 13. Rollback daily limit on failure (legacy, now inert: nothing is pre-incremented)
   if (!stepSuccess && preIncrementedAccountId) {
     try {
       await supabase.rpc('rollback_daily_limit_increment', {
