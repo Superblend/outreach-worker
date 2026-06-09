@@ -1097,6 +1097,29 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
           allowInviteFallback: !isFollowUp,
         });
 
+        // Not-connected guard: the recipient isn't a 1st-degree connection (invite not
+        // accepted yet, or they disconnected so the stored chat 404s). Defer and re-check
+        // later instead of recording a failed send. Covers the cases the pre-send
+        // acceptance gate can't see (e.g. a follow-up with no prior invitation in-log).
+        if ((result as any)?.notConnected) {
+          const recheckAt = new Date(Date.now() + ACCEPTANCE_RECHECK_MS).toISOString();
+          await supabase.from('unipile_sequence_executions')
+            .update({
+              next_execution_at: recheckAt,
+              execution_log: [...executionLog, {
+                step_id: currentStep.id,
+                step_type: 'linkedin_message',
+                action: 'waiting_for_acceptance',
+                reason: 'recipient_not_connected',
+                executed_at: new Date().toISOString(),
+              }],
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', execution_id);
+          console.log(`⏳ [${execution_id}] message recipient not connected; deferred to ${recheckAt}`);
+          return;
+        }
+
         // Phantom guard: invitation_id with no message_id / chat_id means the sender fell
         // back to the LinkedIn invitation endpoint instead of sending a real message.
         // Mark the step skipped, roll back the daily counter, and advance normally.

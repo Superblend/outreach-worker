@@ -44,14 +44,18 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
   const unipileAccountId = accountRow.account_id;
   const personalizedMessage = normalizeAndReplace(params.message || '', lead);
 
-  // Step 3: If a chat_id is already known, skip straight to send
+  // Step 3: If a chat_id is already known, try it first. On a stale/invalid chat
+  // (e.g. a 404 because the connection was removed or the stored id is wrong) fall
+  // through to fresh resolution below instead of failing the whole step.
   const existingChatId = params.chat_id;
   if (existingChatId) {
-    return sendToChat({
+    const direct = await sendToChat({
       apiUrl, unipileAccountId, chatId: existingChatId,
       personalizedMessage, use_inmail,
       providerId: null, publicIdentifier: null,
     });
+    if (direct.success) return direct;
+    console.warn(`[linkedin_message] stored chat ${existingChatId} failed (${direct.error}); re-resolving`);
   }
 
   // Step 1: Resolve provider_id from LinkedIn profile
@@ -88,6 +92,21 @@ export async function sendLinkedInMessage(params: SendLinkedInMessageParams): Pr
   const isFirstDegree =
     profileData?.is_relationship === true ||
     profileData?.network_distance === 'FIRST_DEGREE';
+
+  // Follow-up messages (allowInviteFallback=false) can only be delivered to a
+  // 1st-degree connection. If the recipient is not connected, do NOT fall through to
+  // chat-create (which 404s) — signal "not connected" so the worker waits for
+  // acceptance instead of recording a failed send. (InMail / message-as-invite steps
+  // keep allowInviteFallback=true and are unaffected.)
+  if (!allowInviteFallback && !isFirstDegree) {
+    return {
+      success: false,
+      notConnected: true,
+      error: 'recipient_not_connected',
+      provider_id: providerId,
+      public_identifier: publicIdentifier,
+    };
+  }
 
   // Step 4: Try invite endpoint — only for NON-connections, and only when the step
   // allows it (follow-up steps set allowInviteFallback=false). A 1st-degree connection
