@@ -14,6 +14,26 @@ import { unipileFetch } from '../lib/unipile-fetch';
 import { engagePost } from '../lib/unipile-engage-post';
 import { BatchWriter } from '../lib/batch-db';
 import { isPhantomMessageResult, isLinkedInMessageFollowUp } from '../lib/linkedin-helpers';
+
+// Acceptance gate tuning (post-invitation follow-up messages). A regular
+// follow-up message can only land on a 1st-degree connection, so if the invite
+// hasn't been accepted yet we wait instead of firing a doomed attempt. Bounded
+// so a never-accepter eventually falls through to the normal send path.
+const ACCEPTANCE_MAX_WAIT_MS = 21 * 24 * 60 * 60 * 1000; // wait up to 21 days from the invite
+const ACCEPTANCE_RECHECK_MS = 12 * 60 * 60 * 1000;       // re-check ~twice a day while waiting
+
+/** Most recent linkedin_invitation executed_at (ms) found in an execution_log, or null. */
+function lastInvitationAtFromLog(log: any[]): number | null {
+  if (!Array.isArray(log)) return null;
+  let latest: number | null = null;
+  for (const entry of log) {
+    if (entry?.step_type === 'linkedin_invitation' && entry?.executed_at) {
+      const t = new Date(entry.executed_at).getTime();
+      if (!Number.isNaN(t) && (latest === null || t > latest)) latest = t;
+    }
+  }
+  return latest;
+}
 import { releaseDispatchSlot } from '../orchestrator/dispatch-budget';
 
 /** Release the in-flight dispatch budget slot if the job carries one. */
@@ -1012,6 +1032,57 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
               .update({ chat_id: chatId, updated_at: new Date().toISOString() })
               .eq('id', execution_id);
             console.log(`🔧 [${execution_id}] Hydrated chat_id from prior step results: ${chatId}`);
+          }
+        }
+
+        // ── Acceptance gate: regular (non-InMail) follow-up messages ─────────
+        // A normal follow-up message can only land on a 1st-degree connection.
+        // If this message follows an invitation the lead hasn't accepted yet,
+        // DEFER and re-check later instead of firing a doomed attempt (which
+        // would phantom-skip and waste a LinkedIn action + an orchestrator
+        // dispatch slot). Bounded to ACCEPTANCE_MAX_WAIT_MS from the invite;
+        // past that we fall through to the normal send (which phantom-guards and
+        // advances), so a never-accepter still progresses and a genuine
+        // connection is never permanently skipped. Fail-open: a check error or a
+        // "connected" result both fall through to the send below. InMail can
+        // reach non-connections, so it bypasses the gate entirely.
+        if (isFollowUp && !(cfg.use_inmail || false)) {
+          try {
+            const lastInviteMs = lastInvitationAtFromLog(executionLog);
+            if (lastInviteMs && Date.now() - lastInviteMs < ACCEPTANCE_MAX_WAIT_MS) {
+              const { data: acceptedEvt } = await (supabase
+                .from('unipile_message_events')
+                .select('id')
+                .eq('execution_id', execution_id)
+                .eq('event_type', 'invitation_accepted') as any).maybeSingle();
+              if (!acceptedEvt) {
+                const conn = await checkConnection({ account_id: accountId, lead });
+                if (conn?.success && conn.connected === false) {
+                  const recheckAt = new Date(Date.now() + ACCEPTANCE_RECHECK_MS).toISOString();
+                  await supabase.from('unipile_sequence_executions')
+                    .update({
+                      next_execution_at: recheckAt,
+                      execution_log: [...executionLog, {
+                        step_id: currentStep.id,
+                        step_type: 'linkedin_message',
+                        action: 'waiting_for_acceptance',
+                        executed_at: new Date().toISOString(),
+                      }],
+                      updated_at: new Date().toISOString(),
+                    })
+                    .eq('id', execution_id);
+                  console.log(`⏳ [${execution_id}] follow-up message deferred — invite not accepted yet; recheck ${recheckAt}`);
+                  return;
+                }
+                // Connected (send) or check failed (fail-open → send). Reuse a
+                // chat_id the connection check resolved, if we don't have one.
+                if (conn?.connected && (conn as any).chat_id && !chatId) chatId = (conn as any).chat_id;
+              }
+            }
+          } catch (gateErr: any) {
+            // Fail-open: never let the gate block a send. Worst case we attempt
+            // a send that the phantom guard handles, exactly as before this gate.
+            console.warn(`⚠️ [${execution_id}] acceptance gate errored, proceeding to send:`, gateErr?.message);
           }
         }
 
