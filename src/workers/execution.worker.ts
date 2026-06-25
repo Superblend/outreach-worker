@@ -416,6 +416,12 @@ async function checkAndRerouteFromConditional(
   const conditionalStep = steps.find((s: any) => s.id === lastEntry.step_id);
   if (!conditionalStep) return null;
 
+  // A `has_email` conditional's branch has nothing to do with connection
+  // status, so a later LinkedIn connection discovery must not reroute it.
+  // Every other (connection-based) conditional reroutes exactly as before.
+  const condType = conditionalStep.configuration?.condition_type ?? 'already_connected';
+  if (condType === 'has_email') return null;
+
   const { data: yesEdge } = await supabase
     .from('unipile_sequence_edges')
     .select('target_step_id')
@@ -583,7 +589,14 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
   // 5. First-step connection check
   const isFirstStep = executionLog.length === 0;
 
-  if (isFirstStep && firstStep && (firstStep.step_type === 'linkedin_invitation' || firstStep.step_type === 'conditional')) {
+  // A `has_email` conditional is a pure local check and must NOT trigger a
+  // LinkedIn connection lookup, even as the first step.
+  const firstStepNeedsConnCheck =
+    firstStep?.step_type === 'linkedin_invitation' ||
+    (firstStep?.step_type === 'conditional' &&
+      (firstStep.configuration?.condition_type ?? 'already_connected') !== 'has_email');
+
+  if (isFirstStep && firstStep && firstStepNeedsConnCheck) {
     const linkedInAccountId = assignedLinkedInAccountId ||
       firstStep.configuration?.account_id ||
       steps.find((s: any) => LINKEDIN_STEP_TYPES.includes(s.step_type))?.configuration?.account_id;
@@ -1377,6 +1390,11 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
           const connResult = await checkConnection({ account_id: accountId, lead });
           conditionMet = connResult.connected;
           chatId = connResult.chat_id;
+        } else if (conditionType === 'has_email') {
+          // Pure local check — no LinkedIn account or API call needed.
+          const emailAddr = (lead?.email as string | null | undefined)?.trim();
+          conditionMet = !!emailAddr;
+          console.log(`📧 [${execution_id}] has_email check: ${conditionMet ? 'YES' : 'NO'}`);
         } else if (conditionType === 'check_connection' && accountId) {
           let isContact = false;
           let relationError: string | undefined;
