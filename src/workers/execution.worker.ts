@@ -6,6 +6,7 @@ import { supabase, invokeEdgeFunction } from '../supabase';
 import { localMinutesOfDay, localDateString, localWeekday, isWithinActiveWindow, nextValidSendUtc } from '../lib/time-utils';
 import { config } from '../config';
 import { sendEmail } from '../lib/unipile-send-email';
+import { verifyEmailSent } from '../lib/unipile-verify-email-sent';
 import { sendLinkedInInvitation } from '../lib/unipile-send-linkedin-invitation';
 import { sendLinkedInMessage } from '../lib/unipile-send-linkedin-message';
 import { visitProfile } from '../lib/unipile-visit-profile';
@@ -83,6 +84,13 @@ const LINKEDIN_STEP_TYPES = [
 ];
 
 const SENDING_STEP_TYPES = ['linkedin_invitation', 'linkedin_message', 'email'];
+
+// Email "indeterminate send" reconciliation (gateway timeout / 5xx / network error).
+// When a send gives us no clear answer, we do not fail-and-move-on and we do not
+// blindly re-send. We record an 'email_send_unconfirmed' log marker, wait, then
+// verify against the Sent folder before deciding to confirm-or-resend.
+const EMAIL_RECONCILE_DELAY_MS = 3 * 60_000; // wait before verifying, lets Unipile settle
+const MAX_EMAIL_RECONCILE = 3;               // resend attempts before giving up (email_failed)
 
 // LinkedIn pacing classes. Different LinkedIn actions carry very different
 // account-safety risk, so we pace them separately. Each class has its own
@@ -1241,6 +1249,46 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
         const accountId = assignedEmailAccountId || cfg.account_id;
         if (!accountId) throw new Error('Missing required email account');
 
+        // ── Reconciliation: a prior attempt for THIS step returned an ambiguous
+        // result (gateway timeout / 5xx / network error). Before we ever re-send,
+        // ask Unipile whether it actually went out. This is what makes the email
+        // send idempotent under re-dispatch (orchestrator, scheduler, stalled job).
+        const unconfirmedEntries = executionLog.filter(
+          (l: any) => l.step_id === currentStep.id && l.action === 'email_send_unconfirmed'
+        );
+        const lastUnconfirmed = unconfirmedEntries[unconfirmedEntries.length - 1];
+        if (lastUnconfirmed) {
+          const verify = await verifyEmailSent({
+            account_id: accountId,
+            recipientEmail: lead.email,
+            subject: lastUnconfirmed.subject || cfg.subject || '',
+            sentAfterISO: lastUnconfirmed.executed_at,
+          });
+          if (verify.delivered) {
+            // It WAS delivered — confirm without re-sending, then advance normally.
+            console.log(`✅ [${execution_id}] email reconciled as DELIVERED (${verify.reason}, provider_id=${verify.provider_id || 'unknown'}) — not re-sending`);
+            stepResult = {
+              success: true,
+              provider_id: verify.provider_id || null,
+              tracking_id: null,
+              subject: lastUnconfirmed.subject || cfg.subject || '',
+              was_reply: !!lastUnconfirmed.was_reply,
+              reconciled: true,
+            };
+            executedAt = lastUnconfirmed.executed_at || new Date().toISOString();
+            nextStepId = await getNextStepId(currentStep.id);
+            break; // → records success step_result, credits limit, advances
+          }
+          if (unconfirmedEntries.length >= MAX_EMAIL_RECONCILE) {
+            // Verified NOT delivered after repeated attempts — stop, surface as failed.
+            console.log(`❌ [${execution_id}] email unconfirmed & not found in Sent after ${unconfirmedEntries.length} attempts — completing as failed`);
+            stepError = `email delivery unconfirmed after ${unconfirmedEntries.length} attempts`;
+            break; // → failure block → completed_reason 'email_failed'
+          }
+          console.log(`🔁 [${execution_id}] prior email send unconfirmed & not found in Sent (attempt ${unconfirmedEntries.length}/${MAX_EMAIL_RECONCILE}) — re-sending`);
+          // fall through to (re)send below
+        }
+
         let inReplyToMessageId: string | undefined;
         let originalSubject: string | undefined;
 
@@ -1298,6 +1346,32 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
           stepResult = result;
           executedAt = new Date().toISOString();
           nextStepId = await getNextStepId(currentStep.id);
+        } else if (result.indeterminate) {
+          // Ambiguous outcome (gateway timeout / 5xx / network error): the message
+          // MAY have been delivered. Do NOT fail, do NOT advance, do NOT re-send now.
+          // Record an unconfirmed marker + reschedule so a later run verifies against
+          // the Sent folder before confirming or re-sending. No step_result row is
+          // written here, so nothing downstream treats this as success or failure.
+          const reconcileAt = new Date(Date.now() + EMAIL_RECONCILE_DELAY_MS).toISOString();
+          await supabase.from('unipile_sequence_executions')
+            .update({
+              next_execution_at: reconcileAt,
+              execution_log: [...executionLog, {
+                step_id: currentStep.id,
+                step_type: 'email',
+                action: 'email_send_unconfirmed',
+                executed_at: new Date().toISOString(),
+                subject: emailSubject,
+                was_reply: !!inReplyToMessageId,
+                http_status: result.httpStatus ?? null,
+                error: result.error ?? null,
+                attempt: (executionLog.filter((l: any) => l.step_id === currentStep.id && l.action === 'email_send_unconfirmed').length) + 1,
+              }],
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', execution_id);
+          console.log(`🟡 [${execution_id}] email send INDETERMINATE (${result.error}) — will verify & reconcile in ${EMAIL_RECONCILE_DELAY_MS / 1000}s (no re-send yet)`);
+          return; // exit cleanly; claim released in finally
         } else {
           stepError = result.error || 'Unknown error';
           // 422 on a follow-up means threading data was rejected — pause so data can be corrected
@@ -1806,7 +1880,11 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
 
     if (nonRetryable || !retryable || attemptsMade >= maxRetries) {
       // Every step is gating: exhaust retries → complete with failure reason, never advance
-      const completedReason = `${currentStep.step_type}_failed`;
+      // Distinct reason for a verified non-delivery so it's surfaced as "needs attention"
+      // rather than looking like an ordinary provider rejection.
+      const completedReason = errMsg.startsWith('email delivery unconfirmed')
+        ? 'email_delivery_unconfirmed'
+        : `${currentStep.step_type}_failed`;
       await supabase.from('unipile_sequence_executions')
         .update({
           status: 'completed',

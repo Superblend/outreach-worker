@@ -82,19 +82,51 @@ export async function sendEmail(params: SendEmailParams): Promise<any> {
     payload.reply_to = in_reply_to_message_id;
   }
 
-  const res = await unipileFetch(`${apiUrl}/api/v1/emails`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-KEY': config.unipile.apiKey,
-    },
-    body: JSON.stringify(payload),
-  });
+  // ── TEST-ONLY simulation hook (inert unless env is set) ──────────────────────
+  // Lets us drive the indeterminate/reconciliation path deterministically on
+  // staging without a real Unipile outage. SIMULATE_EMAIL_INDETERMINATE_TO=<email>
+  //   mode 'before_send' (default): return indeterminate WITHOUT sending  → tests re-send path
+  //   mode 'after_send'           : really send, THEN return indeterminate → tests confirm-no-resend path
+  const simTo = process.env.SIMULATE_EMAIL_INDETERMINATE_TO?.toLowerCase();
+  const simMode = (process.env.SIMULATE_EMAIL_INDETERMINATE_MODE || 'before_send').toLowerCase();
+  const isSim = !!simTo && (lead?.email || '').toLowerCase() === simTo;
+  if (isSim && simMode === 'before_send') {
+    console.warn(`[SIM] email to ${lead.email}: returning indeterminate WITHOUT sending`);
+    return { success: false, indeterminate: true, error: 'simulated gateway time-out (before_send)' };
+  }
+
+  let res: Response;
+  try {
+    res = await unipileFetch(`${apiUrl}/api/v1/emails`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-KEY': config.unipile.apiKey,
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (err: any) {
+    // Connection reset / abort / DNS — the request may or may not have been
+    // delivered. Ambiguous → let the caller reconcile before re-sending.
+    return { success: false, indeterminate: true, error: `network_error: ${err?.message || err}` };
+  }
 
   const data = await res.json().catch(() => null);
 
   if (!res.ok) {
-    return { success: false, error: data?.error || data?.message || res.statusText };
+    const errMsg = data?.error || data?.message || res.statusText || `HTTP ${res.status}`;
+    // Gateway/timeout classes mean "we got no clear answer" — the message may
+    // have been delivered. Flag as indeterminate so the caller verifies against
+    // the Sent folder before deciding to re-send (prevents duplicate deliveries).
+    const indeterminate =
+      [502, 503, 504, 408, 425, 522, 524].includes(res.status) ||
+      /time-?out|gateway|temporarily unavailable/i.test(errMsg);
+    return { success: false, indeterminate, httpStatus: res.status, error: errMsg };
+  }
+
+  if (isSim && simMode === 'after_send') {
+    console.warn(`[SIM] email to ${lead.email}: really sent, but returning indeterminate (after_send)`);
+    return { success: false, indeterminate: true, error: 'simulated gateway time-out (after_send)' };
   }
 
   return {
