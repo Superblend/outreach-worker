@@ -3,7 +3,7 @@ import { Worker, Job } from 'bullmq';
 import { connection, executionQueue, getAccountQueue } from '../queues/definitions';
 import { workerHealth } from '../health';
 import { supabase, invokeEdgeFunction } from '../supabase';
-import { localMinutesOfDay, localDateString, localWeekday, isWithinActiveWindow, nextValidSendUtc } from '../lib/time-utils';
+import { localMinutesOfDay, localWeekday, isWithinActiveWindow, nextValidSendUtc, isInDailyWindow, enforceDailyWindow } from '../lib/time-utils';
 import { config } from '../config';
 import { sendEmail } from '../lib/unipile-send-email';
 import { verifyEmailSent } from '../lib/unipile-verify-email-sent';
@@ -304,29 +304,15 @@ async function enforceTimeWindow(proposedTime: Date, sequence: any): Promise<Dat
   if (!sequence?.scheduled_start_time || !sequence?.scheduled_end_time) {
     return proposedTime;
   }
-
-  const timezone = sequence.timezone || 'UTC';
-  const [startH, startM] = sequence.scheduled_start_time.split(':').map(Number);
-  const [endH, endM] = sequence.scheduled_end_time.split(':').map(Number);
-
-  // Use formatToParts-based helper — avoids the "2 AM" / NaN bug from
-  // toLocaleString('en-US', { hour: 'numeric', hour12: false }) on some Node images
-  const curMin = localMinutesOfDay(proposedTime, timezone);
-  const startMin = startH * 60 + startM;
-  const endMin = endH * 60 + endM;
-
-  if (curMin >= startMin && curMin <= endMin) return proposedTime;
-
-  // Within 15 min past window end: allow the send rather than deferring to next day.
-  // Prevents queue-backlog delays from bumping a whole day's sends to tomorrow.
-  if (curMin > endMin && curMin <= endMin + 15) return proposedTime;
-
-  // Use local date (not UTC date) so a timezone offset doesn't push us to the wrong calendar day
-  const targetDate = curMin > endMin
-    ? new Date(proposedTime.getTime() + 86_400_000)  // past end → next local day
-    : proposedTime;                                    // before start → same local day
-  const dateStr = localDateString(targetDate, timezone);
-  return convertToUTC(dateStr, startH, startM, timezone);
+  // enforceDailyWindow is overnight-aware (start > end wraps past midnight) and
+  // carries the same 15-min past-end grace. Uses formatToParts internally to avoid
+  // the "2 AM" / NaN bug from toLocaleString hour12:false on some Node images.
+  return enforceDailyWindow(
+    proposedTime,
+    sequence.scheduled_start_time,
+    sequence.scheduled_end_time,
+    sequence.timezone || 'UTC',
+  );
 }
 
 /**
@@ -364,11 +350,17 @@ async function capRetryReschedule(
 
   if (endTime) {
     const [endH, endM] = endTime.split(':').map(Number);
+    const [startH, startM] = (sequence?.scheduled_start_time || '09:00').split(':').map(Number);
     const candidateMin = localMinutesOfDay(candidate, timezone);
     const endMin = endH * 60 + endM;
-    // 15-min grace matches enforceTimeWindow's existing convention. Past that,
-    // there's no realistic chance of sending today — push to tomorrow.
-    if (candidateMin > endMin + 15) {
+    const startMin = startH * 60 + startM;
+    // If the jittered retry would land outside the active window (beyond the
+    // 15-min past-end grace), there's no room left today — push to the next
+    // active day. isInDailyWindow is overnight-aware (16:00–11:30 wraps midnight),
+    // so an evening/early-morning retry inside an overnight window stays today.
+    const stillRoomToday = isInDailyWindow(candidateMin, startMin, endMin)
+      || (candidateMin > endMin && candidateMin <= endMin + 15);
+    if (!stillRoomToday) {
       return smartReschedule(execution, accountId, messageType, defaultLimit);
     }
   }
@@ -399,7 +391,14 @@ async function smartReschedule(
     const localDay = localWeekday(candidate, timezone);
     if (!activeDays.includes(localDay)) continue;
 
-    const windowMs = (endH * 60 + endM - startH * 60 - startM) * 60 * 1000;
+    // Overnight windows (start > end) wrap past midnight, so the naive
+    // end-minus-start span would be negative — measure the wrapped length instead.
+    const startMinTotal = startH * 60 + startM;
+    const endMinTotal = endH * 60 + endM;
+    const windowLenMin = endMinTotal >= startMinTotal
+      ? endMinTotal - startMinTotal
+      : 1440 - startMinTotal + endMinTotal;
+    const windowMs = windowLenMin * 60 * 1000;
     const jitter = Math.random() * Math.min(windowMs, 3_600_000);
     const dateStr = candidate.toLocaleDateString('en-CA', { timeZone: timezone });
     const baseTime = convertToUTC(dateStr, startH, startM, timezone);
@@ -542,7 +541,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     const [endH, endM] = sequence.scheduled_end_time.split(':').map(Number);
     const startMin = startH * 60 + startM;
     const endMin = endH * 60 + endM;
-    if (curMin < startMin || curMin > endMin) {
+    if (!isInDailyWindow(curMin, startMin, endMin)) {
       const nextAt = await enforceTimeWindow(new Date(), sequence);
       await supabase.from('unipile_sequence_executions')
         .update({ next_execution_at: nextAt.toISOString(), updated_at: new Date().toISOString() })

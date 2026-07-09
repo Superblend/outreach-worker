@@ -57,13 +57,74 @@ export function localWeekday(date: Date, timezone: string): number {
 const DAY_ABBREV_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 /**
+ * Membership test for a daily sending window, expressed in minutes-since-midnight.
+ * Handles both same-day windows (start <= end, e.g. 09:00–18:00) and overnight
+ * windows that wrap past midnight (start > end, e.g. 16:00–11:30 next morning).
+ *
+ * End is inclusive. A degenerate window where start === end is treated as
+ * always-open (24h) to preserve the "no gating" behaviour of a zero-length span.
+ */
+export function isInDailyWindow(curMin: number, startMin: number, endMin: number): boolean {
+  if (startMin === endMin) return true;              // degenerate → all-day
+  return startMin < endMin
+    ? curMin >= startMin && curMin <= endMin          // same-day
+    : curMin >= startMin || curMin <= endMin;         // overnight (wraps midnight)
+}
+
+/**
+ * Converts a local wall-clock time (YYYY-MM-DD + hour:minute in `timezone`) to the
+ * corresponding UTC instant. Canonical version of the per-file convertToUTC copies.
+ */
+export function convertLocalToUtc(dateStr: string, hour: number, minute: number, timezone: string): Date {
+  const timeStr = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
+  const date = new Date(`${dateStr}T${timeStr}.000Z`);
+  const utcDate = new Date(date.toLocaleString('en-US', { timeZone: 'UTC' }));
+  const tzDate = new Date(date.toLocaleString('en-US', { timeZone: timezone }));
+  const offsetMs = tzDate.getTime() - utcDate.getTime();
+  return new Date(date.getTime() - offsetMs);
+}
+
+/**
+ * Given a proposed send time, returns the same time if it falls within the daily
+ * window (with a 15-minute past-end grace for queue-backlog stragglers), otherwise
+ * the next window-open instant. Overnight-aware via {@link isInDailyWindow}.
+ *
+ * The "next window-open" target is today when we're before the window start
+ * (covers both a same-day morning and the midday gap of an overnight window) and
+ * tomorrow when we're already past a same-day window's end.
+ */
+export function enforceDailyWindow(
+  proposedTime: Date,
+  startStr: string,
+  endStr: string,
+  timezone: string,
+): Date {
+  const [startH, startM] = startStr.split(':').map(Number);
+  const [endH, endM] = endStr.split(':').map(Number);
+  const startMin = startH * 60 + startM;
+  const endMin = endH * 60 + endM;
+  const curMin = localMinutesOfDay(proposedTime, timezone);
+
+  if (isInDailyWindow(curMin, startMin, endMin)) return proposedTime;
+  // 15-min grace just past window end (only reachable for same-day / overnight morning close).
+  if (curMin > endMin && curMin <= endMin + 15) return proposedTime;
+
+  // Before start (same-day morning, or overnight midday gap) → today; else past a
+  // same-day end → tomorrow. Uses local date so a TZ offset can't shift the day.
+  const targetDate = curMin < startMin
+    ? proposedTime
+    : new Date(proposedTime.getTime() + 86_400_000);
+  return convertLocalToUtc(localDateString(targetDate, timezone), startH, startM, timezone);
+}
+
+/**
  * Returns { ok: true } if `now` falls within the sequence's active_days and sending window
  * (both evaluated in the sequence's timezone), or { ok: false, reason } otherwise.
  *
  * Edge cases:
  *   - active_days null/empty → treated as all days active
  *   - scheduled_start_time/end_time null → only day check applies
- *   - end_time <= start_time (overnight/misconfig) → time check skipped
+ *   - end_time < start_time (overnight) → window wraps past midnight, gated via isInDailyWindow
  *   - timezone null → 'UTC'
  */
 export function isWithinActiveWindow(
@@ -89,9 +150,9 @@ export function isWithinActiveWindow(
     const [eh, em] = seq.scheduled_end_time.split(':').map(Number);
     const startMin = sh * 60 + sm;
     const endMin = eh * 60 + em;
-    // Overnight window or misconfigured — skip time check to avoid blocking
-    if (endMin <= startMin) return { ok: true };
-    if (nowMin < startMin || nowMin >= endMin) {
+    // Overnight windows (start > end) wrap past midnight and are gated correctly
+    // by isInDailyWindow — no longer skipped.
+    if (!isInDailyWindow(nowMin, startMin, endMin)) {
       const hh = Math.floor(nowMin / 60);
       const mm = nowMin % 60;
       return { ok: false, reason: `outside_window:${hh}:${String(mm).padStart(2, '0')}` };

@@ -4,7 +4,7 @@ import { connection, executionQueue, batchQueue, scannerQueue, recoveryQueue, ge
 import { supabase } from './supabase';
 import { config } from './config';
 import { workerHealth } from './health';
-import { localMinutesOfDay, localDateString, localWeekday } from './lib/time-utils';
+import { localMinutesOfDay, localDateString, localWeekday, isInDailyWindow } from './lib/time-utils';
 import { workerManager } from './worker-manager';
 
 // One random 4-byte hex per process lifetime.
@@ -187,11 +187,13 @@ async function scanAndEnqueue() {
 
         console.log(`Scanner: [${exec.id}] timezone=${timezone} localMin=${curMin} window=${startMin}-${endMin}`);
 
-        if (curMin < startMin || curMin > endMin) {
-          // Use local date (not UTC) when computing the next window start
-          const targetDate = curMin > endMin
-            ? new Date(now.getTime() + 86_400_000)  // past end → tomorrow local
-            : now;                                    // before start → today local
+        if (!isInDailyWindow(curMin, startMin, endMin)) {
+          // Use local date (not UTC) when computing the next window start.
+          // Before start (same-day morning, or an overnight window's midday gap)
+          // → today; past a same-day end → tomorrow. Overnight-aware.
+          const targetDate = curMin < startMin
+            ? now                                     // before start → today local
+            : new Date(now.getTime() + 86_400_000);   // past end → tomorrow local
           const nextRunUTC = convertToUTC(localDateString(targetDate, timezone), startH, startM, timezone);
           await supabase.from('unipile_sequence_executions')
             .update({ next_execution_at: nextRunUTC.toISOString(), updated_at: new Date().toISOString() })
