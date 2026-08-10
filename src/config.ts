@@ -27,6 +27,12 @@ export const config = {
   },
   port: parseInt(process.env.PORT || '3000', 10),
 
+  // Public origin of the web app (Vercel), used to build unsubscribe links in
+  // campaign emails. MUST be set per Railway environment — the default is the
+  // production domain, so a staging worker left unset would mail prospects a
+  // prod link whose token does not exist in the prod database.
+  appUrl: process.env.APP_PUBLIC_URL || 'https://layerapp.ai',
+
   // When true, any non-GET Unipile request is short-circuited to a fake success
   // response. Reads still hit Unipile so connection checks and profile lookups
   // work normally; only side-effecting calls (invites, messages, emails, etc.)

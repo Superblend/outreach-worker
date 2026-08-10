@@ -1331,6 +1331,22 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
           // If still empty, sendEmail will return the 'Missing required subject' error naturally
         }
 
+        // Unsubscribe footer is a per-campaign opt-in stored on the sequence.
+        // Only build a context when it's on AND the client is resolvable, so a
+        // half-configured campaign sends a normal email instead of failing.
+        const optOutCfg = (sequence?.configuration as any)?.email_opt_out;
+        const optOut =
+          optOutCfg?.enabled === true && sequence?.client_id
+            ? {
+                enabled: true,
+                text: typeof optOutCfg.text === 'string' ? optOutCfg.text : undefined,
+                sequenceId: execution.unipile_sequence_id,
+                clientId: sequence.client_id,
+                contactId,
+                leadId,
+              }
+            : undefined;
+
         const result = await sendEmail({
           account_id: accountId,
           lead,
@@ -1339,6 +1355,7 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
           use_html: cfg.use_html || false,
           in_reply_to_message_id: inReplyToMessageId,
           original_subject: originalSubject,
+          opt_out: optOut,
         });
 
         if (result.success) {

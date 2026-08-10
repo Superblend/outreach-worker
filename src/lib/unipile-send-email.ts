@@ -2,6 +2,7 @@ import { supabase } from '../supabase';
 import { config } from '../config';
 import { unipileFetch } from './unipile-fetch';
 import { normalizeAndReplace } from './variable-replace';
+import { applyOptOut, optOutUrl, resolveOptOutToken, type OptOutContext } from './email-optout';
 
 interface SendEmailParams {
   account_id: string;
@@ -11,6 +12,8 @@ interface SendEmailParams {
   use_html?: boolean;
   in_reply_to_message_id?: string;
   original_subject?: string;
+  /** Set when the campaign has the unsubscribe link switched on. */
+  opt_out?: OptOutContext;
 }
 
 function escapeHtml(text: string): string {
@@ -66,6 +69,19 @@ export async function sendEmail(params: SendEmailParams): Promise<any> {
   let htmlBody = body;
   if (!use_html) {
     htmlBody = escapeHtml(body);
+  }
+
+  // Unsubscribe link, if the campaign asked for one. Deliberately after the
+  // escape step, otherwise the anchor would be escaped into visible markup.
+  // Every failure path here leaves the email unchanged rather than blocking it:
+  // a missing footer is recoverable, a campaign that stops sending is not.
+  if (params.opt_out?.enabled && lead?.email) {
+    const token = await resolveOptOutToken(params.opt_out, lead.email);
+    if (token) {
+      htmlBody = applyOptOut(htmlBody, optOutUrl(token), params.opt_out.text);
+    } else {
+      console.warn(`[optout] no token for ${lead.email}; sending without a footer`);
+    }
   }
 
   // Build email payload
