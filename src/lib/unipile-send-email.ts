@@ -127,17 +127,58 @@ export async function sendEmail(params: SendEmailParams): Promise<any> {
     return { success: false, indeterminate: true, error: `network_error: ${err?.message || err}` };
   }
 
-  const data = await res.json().catch(() => null);
+  // Read the body as text first, then parse. `res.json()` consumes the stream,
+  // so a provider error whose shape we don't recognise used to leave us holding
+  // nothing but `res.statusText` — which is how 64 real 422s were recorded as
+  // the useless string "Unprocessable Entity" with no way to tell why.
+  const rawBody = await res.text().catch(() => '');
+  let data: any = null;
+  try {
+    data = rawBody ? JSON.parse(rawBody) : null;
+  } catch {
+    data = null;
+  }
 
   if (!res.ok) {
-    const errMsg = data?.error || data?.message || res.statusText || `HTTP ${res.status}`;
+    // Unipile is inconsistent about where the reason lives: sometimes `error`
+    // or `message`, sometimes a `detail`/`title` pair, sometimes only the raw
+    // body. Take the first that says something, and always keep the raw body
+    // so a never-seen-before shape is still diagnosable after the fact.
+    const detail =
+      data?.error ||
+      data?.message ||
+      data?.detail ||
+      data?.title ||
+      (Array.isArray(data?.errors) ? JSON.stringify(data.errors) : null);
+    const snippet = rawBody.trim().slice(0, 500);
+    const errMsg = `HTTP ${res.status}${detail ? `: ${detail}` : ''}${
+      !detail && snippet ? `: ${snippet}` : ''
+    }`;
+
     // Gateway/timeout classes mean "we got no clear answer" — the message may
     // have been delivered. Flag as indeterminate so the caller verifies against
     // the Sent folder before deciding to re-send (prevents duplicate deliveries).
     const indeterminate =
       [502, 503, 504, 408, 425, 522, 524].includes(res.status) ||
       /time-?out|gateway|temporarily unavailable/i.test(errMsg);
-    return { success: false, indeterminate, httpStatus: res.status, error: errMsg };
+
+    console.error(
+      `[send-email] ${res.status} from Unipile account=${unipileAccountId} to=${lead?.email} :: ${snippet || '(empty body)'}`,
+    );
+
+    return {
+      success: false,
+      indeterminate,
+      httpStatus: res.status,
+      error: errMsg,
+      // Persisted by the worker so the reason survives in unipile_step_results.
+      provider_error: {
+        http_status: res.status,
+        body: snippet || null,
+        account_id: unipileAccountId,
+        had_opt_out_footer: !!params.opt_out?.enabled,
+      },
+    };
   }
 
   if (isSim && simMode === 'after_send') {

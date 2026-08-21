@@ -429,14 +429,15 @@ async function checkAndRerouteFromConditional(
   const condType = conditionalStep.configuration?.condition_type ?? 'already_connected';
   if (condType === 'has_email') return null;
 
-  const { data: yesEdge } = await supabase
+  // Plain select, not maybeSingle(): duplicate 'yes' edges would resolve to
+  // null and silently drop the reroute.
+  const { data: yesEdges } = await supabase
     .from('unipile_sequence_edges')
     .select('target_step_id')
     .eq('source_step_id', conditionalStep.id)
-    .eq('source_handle', 'yes')
-    .maybeSingle();
+    .eq('source_handle', 'yes');
 
-  return yesEdge?.target_step_id || null;
+  return (yesEdges ?? [])[0]?.target_step_id || null;
 }
 
 async function executeStep(execution_id: string, stepResultWriter: BatchWriter, job: Job<ExecutionJobData>) {
@@ -613,12 +614,12 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
 
       if (connResult.connected) {
         if (firstStep.step_type === 'conditional') {
-          const { data: yesEdge } = await supabase
+          const { data: yesEdges } = await supabase
             .from('unipile_sequence_edges')
             .select('target_step_id')
             .eq('source_step_id', firstStep.id)
-            .eq('source_handle', 'yes')
-            .maybeSingle();
+            .eq('source_handle', 'yes');
+          const yesEdge = (yesEdges ?? [])[0] as { target_step_id: string } | undefined;
 
           if (yesEdge?.target_step_id) {
             await supabase.from('unipile_sequence_executions')
@@ -637,8 +638,29 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
               })
               .eq('id', execution_id);
           } else {
+            // No 'yes' branch wired, so an already-connected lead has nowhere to
+            // go. That may be deliberate (the branch ends the sequence) or a
+            // wiring mistake, and we cannot tell which — but either way it must
+            // not complete with a NULL reason and an empty log, which in the UI
+            // is indistinguishable from "we ran the sequence and it finished".
+            console.warn(
+              `⚠️ [${execution_id}] conditional ${firstStep.id} has no 'yes' edge — completing as conditional_no_branch`,
+            );
             await supabase.from('unipile_sequence_executions')
-              .update({ status: 'completed', updated_at: new Date().toISOString() })
+              .update({
+                status: 'completed',
+                completed_at: new Date().toISOString(),
+                completed_reason: 'conditional_no_branch',
+                execution_log: [...executionLog, {
+                  step_id: firstStep.id,
+                  step_type: 'conditional',
+                  action: 'condition_yes',
+                  executed_at: new Date().toISOString(),
+                  result: { connected: true, chat_id: connResult.chat_id },
+                  error: "no outgoing edge for handle 'yes'",
+                }],
+                updated_at: new Date().toISOString(),
+              })
               .eq('id', execution_id);
           }
         } else {
@@ -1389,6 +1411,11 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
           console.log(`🟡 [${execution_id}] email send INDETERMINATE (${result.error}) — will verify & reconcile in ${EMAIL_RECONCILE_DELAY_MS / 1000}s (no re-send yet)`);
           return; // exit cleanly; claim released in finally
         } else {
+          // Keep the failed result so its provider_error reaches the step_result
+          // row. Previously stepResult stayed null on failure, so `response_data`
+          // was never populated and every rejection was unexplainable after the
+          // fact — see the 64 rows that recorded only "Unprocessable Entity".
+          stepResult = result;
           stepError = result.error || 'Unknown error';
           // 422 on a follow-up means threading data was rejected — pause so data can be corrected
           if (cfg.is_follow_up && (stepError.includes('422') || stepError.includes('Unprocessable'))) {
@@ -1591,12 +1618,22 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
         }
 
         const handle = conditionMet ? 'yes' : 'no';
-        const { data: condEdge } = await supabase
+        // Not maybeSingle(): the builder's handle safety-net can save two edges
+        // on the same handle, and maybeSingle() turns that into `null` — which
+        // used to look identical to "no edge exists" and silently completed the
+        // lead. Take the first edge and warn instead of dropping the lead.
+        const { data: condEdges } = await supabase
           .from('unipile_sequence_edges')
           .select('target_step_id')
           .eq('source_step_id', currentStep.id)
-          .eq('source_handle', handle)
-          .maybeSingle();
+          .eq('source_handle', handle);
+
+        const condEdge = (condEdges ?? [])[0] as { target_step_id: string } | undefined;
+        if ((condEdges?.length ?? 0) > 1) {
+          console.warn(
+            `⚠️ [${execution_id}] conditional ${currentStep.id} has ${condEdges!.length} '${handle}' edges — taking the first`,
+          );
+        }
 
         const condLogEntry = {
           step_id: currentStep.id,
@@ -1618,10 +1655,21 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
             })
             .eq('id', execution_id);
         } else {
+          // Branch not wired: either a deliberate end-of-branch or a builder
+          // mistake. Record which handle ran out of graph so the two are
+          // distinguishable from a sequence that actually ran to completion.
+          console.warn(
+            `⚠️ [${execution_id}] conditional ${currentStep.id} has no '${handle}' edge — completing as conditional_no_branch`,
+          );
           await supabase.from('unipile_sequence_executions')
             .update({
               status: 'completed',
-              execution_log: [...executionLog, condLogEntry],
+              completed_at: new Date().toISOString(),
+              completed_reason: 'conditional_no_branch',
+              execution_log: [...executionLog, {
+                ...condLogEntry,
+                error: `no outgoing edge for handle '${handle}'`,
+              }],
               updated_at: new Date().toISOString(),
             })
             .eq('id', execution_id);
@@ -1773,6 +1821,10 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
       subject: stepResult.subject,
       is_follow_up: !!stepResult.was_reply,
       reply_to: stepResult.in_reply_to_message_id,
+      // Present only on a rejected send: HTTP status + raw provider body, so a
+      // failure can be diagnosed from the row alone without re-running it.
+      ...(stepResult.provider_error ? { provider_error: stepResult.provider_error } : {}),
+      ...(stepError ? { error: stepError } : {}),
     };
   }
 
