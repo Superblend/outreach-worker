@@ -15,6 +15,7 @@ import { unipileFetch } from '../lib/unipile-fetch';
 import { engagePost } from '../lib/unipile-engage-post';
 import { BatchWriter } from '../lib/batch-db';
 import { isPhantomMessageResult, isLinkedInMessageFollowUp } from '../lib/linkedin-helpers';
+import { isProviderUnavailableError } from '../lib/error-classification';
 
 // Acceptance gate tuning (post-invitation follow-up messages). A regular
 // follow-up message can only land on a 1st-degree connection, so if the invite
@@ -91,6 +92,12 @@ const SENDING_STEP_TYPES = ['linkedin_invitation', 'linkedin_message', 'email'];
 // verify against the Sent folder before deciding to confirm-or-resend.
 const EMAIL_RECONCILE_DELAY_MS = 3 * 60_000; // wait before verifying, lets Unipile settle
 const MAX_EMAIL_RECONCILE = 3;               // resend attempts before giving up (email_failed)
+
+// Upstream provider (Gmail/Outlook/LinkedIn) unreachable from Unipile. Sized to
+// outlast a reconnect by a human rather than a network blip: 4h between tries,
+// clamped into the sequence's send window, 8 tries ≈ 3–4 active days.
+const PROVIDER_DEFER_MS = 4 * 60 * 60_000;
+const MAX_PROVIDER_DEFERRALS = 8;
 
 // LinkedIn pacing classes. Different LinkedIn actions carry very different
 // account-safety risk, so we pace them separately. Each class has its own
@@ -242,6 +249,7 @@ function isRetryableError(message: string): boolean {
     lower.includes('edge function')
   );
 }
+
 
 function isNonRetryableError(message: string): boolean {
   const lower = message.toLowerCase();
@@ -1945,6 +1953,65 @@ async function executeStep(execution_id: string, stepResultWriter: BatchWriter, 
     const maxRetries = 3;
     const retryable = isRetryableError(errMsg);
     const nonRetryable = isNonRetryableError(errMsg);
+
+    // Provider outage: hold the lead instead of consuming it. This is its own
+    // path rather than an isRetryableError() pattern because the generic retry
+    // budget (3 attempts at 1/2/4 minutes) is sized for a blip, and a stale
+    // OAuth grant lasts days — all three retries would burn inside 7 minutes
+    // and the lead would still be lost. Deferrals are counted separately from
+    // 'attempt' so a real outage doesn't eat the ordinary retry budget either.
+    if (isProviderUnavailableError(errMsg)) {
+      const deferrals = executionLog.filter(
+        (l: any) => l.step_id === currentStep.id && l.action === 'provider_unavailable_deferred'
+      ).length;
+
+      if (deferrals < MAX_PROVIDER_DEFERRALS) {
+        const retryAt = await enforceTimeWindow(
+          new Date(Date.now() + PROVIDER_DEFER_MS),
+          sequence,
+        );
+        await supabase.from('unipile_sequence_executions')
+          .update({
+            next_execution_at: retryAt.toISOString(),
+            execution_log: [...executionLog, {
+              step_id: currentStep.id,
+              step_type: currentStep.step_type,
+              action: 'provider_unavailable_deferred',
+              error: errMsg,
+              deferral: deferrals + 1,
+              executed_at: new Date().toISOString(),
+            }],
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', execution_id);
+        console.warn(
+          `🟠 [${execution_id}] provider unreachable (${errMsg}) — deferral ${deferrals + 1}/${MAX_PROVIDER_DEFERRALS}, retrying at ${retryAt.toISOString()}. The mailbox likely needs reconnecting.`,
+        );
+        return;
+      }
+
+      // Held as long as we sensibly can. Complete with a reason that names the
+      // infrastructure fault, so these are trivially findable for replay once
+      // the mailbox is reconnected — and never read as a lead-quality outcome.
+      await supabase.from('unipile_sequence_executions')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          completed_reason: `${currentStep.step_type}_provider_unavailable`,
+          execution_log: [...executionLog, {
+            step_id: currentStep.id, step_type: currentStep.step_type,
+            action: 'failed_completed', error: errMsg,
+            deferrals_exhausted: deferrals,
+            executed_at: new Date().toISOString(),
+          }],
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', execution_id);
+      console.error(
+        `❌ [${execution_id}] provider still unreachable after ${deferrals} deferrals — completing as ${currentStep.step_type}_provider_unavailable`,
+      );
+      return;
+    }
 
     if (nonRetryable || !retryable || attemptsMade >= maxRetries) {
       // Every step is gating: exhaust retries → complete with failure reason, never advance
